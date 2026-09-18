@@ -18,7 +18,7 @@ ports:
 ports_description:
   8088/tcp: "StreamHub HTTP API"
 
-watchdog: "http://[HOST]:8088/health"
+watchdog: "watchdog: "http://[HOST]:[PORT:8088]/health"
 
 options:
   servers: []
