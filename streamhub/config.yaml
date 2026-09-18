@@ -18,11 +18,12 @@ ports:
 ports_description:
   8088/tcp: "StreamHub HTTP API"
 
-watchdog: "watchdog: "http://[HOST]:[PORT:8088]/health"
+watchdog: "http://[HOST]:[PORT:8088]/health"
 
 options:
+  public_host: ""
+
   servers: []
-  mag_servers: []
 
   server_username: ""
   server_password: ""
@@ -45,10 +46,9 @@ options:
   epg_url: ""
 
 schema:
-  servers:
-    - str
+  public_host: str
 
-  mag_servers:
+  servers:
     - str
 
   server_username: str
