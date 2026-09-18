@@ -1,1 +1,72 @@
+name: "StreamHub"
+version: "1.0.0"
+slug: "streamhub"
+description: "Multi-provider IPTV hub with Dutch content filtering, persistent caching and automatic failover."
+url: "https://github.com/robinmusch/streamhub"
 
+arch:
+  - aarch64
+  - amd64
+
+startup: application
+boot: auto
+init: false
+
+ports:
+  8088/tcp: 8088
+
+ports_description:
+  8088/tcp: "StreamHub HTTP API"
+
+watchdog: "http://[HOST]:8088/health"
+
+options:
+  servers: []
+  mag_servers: []
+
+  server_username: ""
+  server_password: ""
+  proxy_access_key: ""
+
+  country_marker: "┃NL┃"
+
+  tv_cache_hours: 1
+  movies_cache_hours: 6
+  series_cache_hours: 12
+
+  health_check_seconds: 900
+  backup_health_check_seconds: 21600
+  health_timeout_seconds: 8
+
+  series_workers: 1
+  series_request_delay: 1.5
+
+  epg_enabled: true
+  epg_url: ""
+
+schema:
+  servers:
+    - str
+
+  mag_servers:
+    - str
+
+  server_username: str
+  server_password: password
+  proxy_access_key: password
+
+  country_marker: str
+
+  tv_cache_hours: int
+  movies_cache_hours: int
+  series_cache_hours: int
+
+  health_check_seconds: int
+  backup_health_check_seconds: int
+  health_timeout_seconds: int
+
+  series_workers: int
+  series_request_delay: float
+
+  epg_enabled: bool
+  epg_url: str
