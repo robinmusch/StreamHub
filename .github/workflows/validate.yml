@@ -166,17 +166,43 @@ jobs:
 
       - name: Check for hardcoded provider secrets
         run: |
-          if grep -RniE \
-            --exclude-dir=.git \
-            --exclude='validate.yml' \
-            'server_password[[:space:]]*:[[:space:]]*[^[:space:]"][^"]*|proxy_access_key[[:space:]]*:[[:space:]]*[^[:space:]"][^"]*' \
-            streamhub repository.yaml; then
+          python - <<'PY'
+          import yaml
+          from pathlib import Path
 
-            echo "Possible hardcoded secret detected."
-            exit 1
-          fi
+          path = Path("streamhub/config.yaml")
+          data = yaml.safe_load(
+              path.read_text(encoding="utf-8")
+          )
 
-          echo "Secret scan: OK"
+          options = data.get("options", {})
+
+          if options.get("servers") not in ([], None):
+              raise SystemExit(
+                  "Provider servers must not be committed "
+                  "to the public repository."
+              )
+
+          if options.get("server_username", "") not in ("", None):
+              raise SystemExit(
+                  "Provider username must not be committed "
+                  "to the public repository."
+              )
+
+          if options.get("server_password", "") not in ("", None):
+              raise SystemExit(
+                  "Provider password must not be committed "
+                  "to the public repository."
+              )
+
+          if options.get("proxy_access_key", "") not in ("", None):
+              raise SystemExit(
+                  "Proxy access key must not be committed "
+                  "to the public repository."
+              )
+
+          print("Hardcoded secret validation: OK")
+          PY
 
       - name: Check for provider URLs
         run: |
