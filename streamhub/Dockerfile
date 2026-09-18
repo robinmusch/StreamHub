@@ -1,5 +1,10 @@
 FROM ghcr.io/home-assistant/base:latest
 
+LABEL \
+    io.hass.version="1.0.0" \
+    io.hass.type="app" \
+    io.hass.arch="aarch64|amd64"
+
 WORKDIR /app
 
 COPY run.sh /app/run.sh
