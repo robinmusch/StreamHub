@@ -69,7 +69,10 @@ def load_config():
                 config.update(options)
 
     except Exception as exc:
-        LOGGER.error("Unable to load configuration: %s", exc)
+        LOGGER.error(
+            "Unable to load configuration: %s",
+            exc,
+        )
 
     return config
 
@@ -210,7 +213,12 @@ def check_xtream_server(server):
 
     timeout = max(
         1,
-        int(CONFIG.get("health_timeout_seconds", 8)),
+        int(
+            CONFIG.get(
+                "health_timeout_seconds",
+                8,
+            )
+        ),
     )
 
     if not username or not password:
@@ -427,6 +435,48 @@ def check_provider(server):
     return result
 
 
+# ---------------------------------------------------------------------------
+# Provider health checks
+# ---------------------------------------------------------------------------
+
+def check_servers(servers, reason):
+    if not servers:
+        return
+
+    configured = configured_servers()
+
+    LOGGER.info(
+        "Checking %d IPTV provider(s) (%s)",
+        len(servers),
+        reason,
+    )
+
+    for server in servers:
+        try:
+            priority = configured.index(server) + 1
+        except ValueError:
+            priority = None
+
+        result = check_provider(server)
+
+        if result["online"]:
+            if priority is not None:
+                LOGGER.info(
+                    "P%d online (%sms)",
+                    priority,
+                    result["response_time_ms"],
+                )
+        else:
+            if priority is not None:
+                LOGGER.warning(
+                    "P%d offline: %s",
+                    priority,
+                    result["reason"],
+                )
+
+    select_active_server()
+
+
 def check_all_servers():
     servers = configured_servers()
 
@@ -438,34 +488,87 @@ def check_all_servers():
         LOGGER.warning(
             "No IPTV providers configured"
         )
-
         return
 
-    LOGGER.info(
-        "Checking %d IPTV provider(s)",
-        len(servers),
+    check_servers(
+        servers,
+        "full provider check",
     )
 
-    for priority, server in enumerate(
-        servers,
-        start=1,
-    ):
-        result = check_provider(server)
+    with STATE_LOCK:
+        STATE["last_health_check"] = int(time.time())
 
-        if result["online"]:
-            LOGGER.info(
-                "P%d online (%sms)",
-                priority,
-                result["response_time_ms"],
-            )
-        else:
-            LOGGER.warning(
-                "P%d offline: %s",
-                priority,
-                result["reason"],
-            )
 
-    select_active_server()
+def check_active_server():
+    servers = configured_servers()
+
+    if not servers:
+        check_all_servers()
+        return
+
+    with STATE_LOCK:
+        active = STATE["active_server"]
+
+    # No active provider: immediately check all providers.
+    if active not in servers:
+        check_all_servers()
+        return
+
+    # Active provider gets the frequent health check.
+    check_servers(
+        [active],
+        "active provider check",
+    )
+
+    with STATE_LOCK:
+        current_active = STATE["active_server"]
+
+    if current_active not in servers:
+        check_all_servers()
+        return
+
+    # Providers with higher priority than the active backup are
+    # checked only according to the backup health interval.
+    active_index = servers.index(current_active)
+    higher_priority = servers[:active_index]
+
+    if higher_priority:
+        now = time.time()
+
+        backup_interval = max(
+            60,
+            int(
+                CONFIG.get(
+                    "backup_health_check_seconds",
+                    21600,
+                )
+            ),
+        )
+
+        due = []
+
+        with STATE_LOCK:
+            for server in higher_priority:
+                state = STATE["servers"].get(
+                    server,
+                    {},
+                )
+
+                last_check = state.get(
+                    "last_check"
+                )
+
+                if (
+                    last_check is None
+                    or now - last_check >= backup_interval
+                ):
+                    due.append(server)
+
+        if due:
+            check_servers(
+                due,
+                "backup recovery check",
+            )
 
     with STATE_LOCK:
         STATE["last_health_check"] = int(time.time())
@@ -478,7 +581,7 @@ def check_all_servers():
 def health_loop():
     while True:
         try:
-            check_all_servers()
+            check_active_server()
 
         except Exception as exc:
             LOGGER.error(
@@ -570,9 +673,9 @@ class StreamHubHandler(BaseHTTPRequestHandler):
         path = parsed.path
         query = parse_qs(parsed.query)
 
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
         # Home Assistant watchdog
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
 
         if path == "/health":
             send_json(
@@ -587,9 +690,9 @@ class StreamHubHandler(BaseHTTPRequestHandler):
 
             return
 
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
         # Authentication
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
 
         if not is_authorized(query):
             send_json(
@@ -603,9 +706,9 @@ class StreamHubHandler(BaseHTTPRequestHandler):
 
             return
 
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
         # Root
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
 
         if path == "/":
             base_url = get_public_base_url(self)
@@ -628,9 +731,9 @@ class StreamHubHandler(BaseHTTPRequestHandler):
 
             return
 
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
         # Status
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
 
         if path == "/status":
             servers = configured_servers()
@@ -703,9 +806,9 @@ class StreamHubHandler(BaseHTTPRequestHandler):
 
             return
 
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
         # Manual provider check
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
 
         if path == "/check-servers":
             thread = threading.Thread(
@@ -729,9 +832,9 @@ class StreamHubHandler(BaseHTTPRequestHandler):
 
             return
 
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
         # Refresh placeholder
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
 
         if path == "/refresh":
             send_json(
@@ -748,9 +851,9 @@ class StreamHubHandler(BaseHTTPRequestHandler):
 
             return
 
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
         # Unknown endpoint
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
 
         send_json(
             self,
@@ -809,10 +912,10 @@ def start_server():
 
     STATE["started"] = True
 
-    # One initial check at startup.
+    # One complete provider check at startup.
     check_all_servers()
 
-    # Independent background health monitoring.
+    # Background health monitoring.
     health_thread = threading.Thread(
         target=health_loop,
         name="streamhub-health",
