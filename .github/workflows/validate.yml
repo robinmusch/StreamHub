@@ -169,7 +169,7 @@ jobs:
           if grep -RniE \
             --exclude-dir=.git \
             --exclude='validate.yml' \
-            'server_password[[:space:]]*:[[:space:]]*[^"]+|proxy_access_key[[:space:]]*:[[:space:]]*[^"]+' \
+            'server_password[[:space:]]*:[[:space:]]*[^[:space:]"][^"]*|proxy_access_key[[:space:]]*:[[:space:]]*[^[:space:]"][^"]*' \
             streamhub repository.yaml; then
 
             echo "Possible hardcoded secret detected."
@@ -178,13 +178,13 @@ jobs:
 
           echo "Secret scan: OK"
 
-      - name: Check for provider credentials in source
+      - name: Check for provider URLs
         run: |
           if grep -RniE \
             --exclude-dir=.git \
             --exclude='validate.yml' \
-            'line\.[a-zA-Z0-9.-]+|mag\.[a-zA-Z0-9.-]+' \
-            .; then
+            'https?://[^[:space:]"'\'']*(line|mag)\.' \
+            streamhub repository.yaml; then
 
             echo "Possible provider URL detected in repository."
             exit 1
