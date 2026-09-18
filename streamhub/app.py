@@ -15,7 +15,7 @@ from urllib.request import Request, urlopen
 
 
 APP_NAME = "StreamHub"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 HOST = "0.0.0.0"
 PORT = 8088
@@ -23,6 +23,7 @@ PORT = 8088
 OPTIONS_FILE = Path("/data/options.json")
 CACHE_DIR = Path("/data/cache")
 SERIES_STATE_FILE = Path("/data/series_state.json")
+PROVIDER_STATE_FILE = Path("/data/provider_state.json")
 
 CACHE_FILES = {
     "tv": CACHE_DIR / "tv.json",
@@ -34,6 +35,8 @@ CACHE_FILES = {
 DEFAULT_CONFIG = {
     "public_host": "",
     "servers": [],
+    "provider_mode": "AUTO",
+    "forced_provider_priority": 0,
     "server_username": "",
     "server_password": "",
     "proxy_access_key": "",
@@ -396,6 +399,10 @@ STATE = {
     "started": False,
     "active_server": None,
     "servers": {},
+    "provider_selection": {
+        "mode": "AUTO",
+        "forced_provider_priority": 0,
+    },
     "last_health_check": None,
     "refresh_running": False,
     "last_refresh_started": None,
@@ -1450,28 +1457,13 @@ def category_map(categories):
 # ============================================================================
 
 def check_xtream_server(server):
-    username = str(
-        CONFIG.get(
-            "server_username",
-            "",
-        )
-        or ""
-    )
-
-    password = str(
-        CONFIG.get(
-            "server_password",
-            "",
-        )
-        or ""
-    )
+    username = str(CONFIG.get("server_username", "") or "")
+    password = str(CONFIG.get("server_password", "") or "")
 
     if not username or not password:
         return {
             "online": False,
-            "reason": (
-                "credentials_not_configured"
-            ),
+            "reason": "credentials_not_configured",
             "response_time_ms": None,
         }
 
@@ -1484,11 +1476,7 @@ def check_xtream_server(server):
         )
 
         elapsed_ms = round(
-            (
-                time.monotonic()
-                - started
-            )
-            * 1000,
+            (time.monotonic() - started) * 1000,
             1,
         )
 
@@ -1506,7 +1494,6 @@ def check_xtream_server(server):
                     errors="replace",
                 )
             )
-
         except json.JSONDecodeError:
             return {
                 "online": False,
@@ -1514,41 +1501,26 @@ def check_xtream_server(server):
                 "response_time_ms": elapsed_ms,
             }
 
-        user_info = data.get(
-            "user_info"
-        )
+        user_info = data.get("user_info")
 
-        if not isinstance(
-            user_info,
-            dict,
-        ):
+        if not isinstance(user_info, dict):
             return {
                 "online": False,
-                "reason": (
-                    "invalid_xtream_response"
-                ),
+                "reason": "invalid_xtream_response",
                 "response_time_ms": elapsed_ms,
             }
 
-        auth = user_info.get(
-            "auth"
-        )
+        auth = user_info.get("auth")
 
         if auth is False or auth == 0:
             return {
                 "online": False,
-                "reason": (
-                    "authentication_failed"
-                ),
+                "reason": "authentication_failed",
                 "response_time_ms": elapsed_ms,
             }
 
         account_status = str(
-            user_info.get(
-                "status",
-                "",
-            )
-            or ""
+            user_info.get("status", "") or ""
         ).lower()
 
         if (
@@ -1562,9 +1534,7 @@ def check_xtream_server(server):
         ):
             return {
                 "online": False,
-                "reason": (
-                    f"account_{account_status}"
-                ),
+                "reason": f"account_{account_status}",
                 "response_time_ms": elapsed_ms,
             }
 
@@ -1576,11 +1546,7 @@ def check_xtream_server(server):
 
     except HTTPError as exc:
         elapsed_ms = round(
-            (
-                time.monotonic()
-                - started
-            )
-            * 1000,
+            (time.monotonic() - started) * 1000,
             1,
         )
 
@@ -1595,24 +1561,18 @@ def check_xtream_server(server):
         TimeoutError,
     ) as exc:
         elapsed_ms = round(
-            (
-                time.monotonic()
-                - started
-            )
-            * 1000,
+            (time.monotonic() - started) * 1000,
             1,
-        )
-
-        reason = getattr(
-            exc,
-            "reason",
-            None,
         )
 
         return {
             "online": False,
             "reason": str(
-                reason
+                getattr(
+                    exc,
+                    "reason",
+                    None,
+                )
                 or "connection_error"
             ),
             "response_time_ms": elapsed_ms,
@@ -1620,19 +1580,13 @@ def check_xtream_server(server):
 
     except Exception as exc:
         elapsed_ms = round(
-            (
-                time.monotonic()
-                - started
-            )
-            * 1000,
+            (time.monotonic() - started) * 1000,
             1,
         )
 
         return {
             "online": False,
-            "reason": type(
-                exc
-            ).__name__,
+            "reason": type(exc).__name__,
             "response_time_ms": elapsed_ms,
         }
 
@@ -1652,9 +1606,7 @@ def update_server_state(
         state.update(
             {
                 "online": bool(
-                    result[
-                        "online"
-                    ]
+                    result["online"]
                 ),
                 "reason": result[
                     "reason"
@@ -1669,6 +1621,117 @@ def update_server_state(
         )
 
 
+def load_provider_control():
+    payload = read_json_file(
+        PROVIDER_STATE_FILE
+    )
+
+    if not isinstance(
+        payload,
+        dict,
+    ):
+        payload = {}
+
+    mode = str(
+        payload.get(
+            "mode",
+            CONFIG.get(
+                "provider_mode",
+                "AUTO",
+            ),
+        )
+        or "AUTO"
+    ).strip().upper()
+
+    if mode not in {
+        "AUTO",
+        "FORCED",
+    }:
+        mode = "AUTO"
+
+    priority = safe_int(
+        payload.get(
+            "forced_provider_priority",
+            CONFIG.get(
+                "forced_provider_priority",
+                0,
+            ),
+        ),
+        0,
+    )
+
+    return {
+        "mode": mode,
+        "forced_provider_priority": priority,
+    }
+
+
+def save_provider_control(
+    mode,
+    priority,
+):
+    mode = str(
+        mode or "AUTO"
+    ).strip().upper()
+
+    if mode not in {
+        "AUTO",
+        "FORCED",
+    }:
+        mode = "AUTO"
+
+    atomic_write_json(
+        PROVIDER_STATE_FILE,
+        {
+            "mode": mode,
+            "forced_provider_priority": safe_int(
+                priority,
+                0,
+            ),
+        },
+    )
+
+
+def provider_mode():
+    return load_provider_control()[
+        "mode"
+    ]
+
+
+def forced_provider_priority():
+    control = load_provider_control()
+
+    if control["mode"] != "FORCED":
+        return 0
+
+    priority = control[
+        "forced_provider_priority"
+    ]
+
+    if (
+        priority < 1
+        or priority > len(
+            configured_servers()
+        )
+    ):
+        return 0
+
+    return priority
+
+
+def provider_selection_state():
+    control = load_provider_control()
+
+    return {
+        "mode": control["mode"],
+        "forced_provider_priority": (
+            forced_provider_priority()
+            if control["mode"] == "FORCED"
+            else 0
+        ),
+    }
+
+
 def select_active_server():
     servers = configured_servers()
 
@@ -1677,25 +1740,97 @@ def select_active_server():
             "active_server"
         ]
 
-        selected = None
+        healthy = []
 
-        for server in servers:
+        for priority, server in enumerate(
+            servers,
+            start=1,
+        ):
             state = STATE[
                 "servers"
-            ].get(server)
+            ].get(
+                server,
+                {},
+            )
+
+            if state.get(
+                "online"
+            ) is True:
+                latency = state.get(
+                    "response_time_ms"
+                )
+
+                healthy.append(
+                    (
+                        latency
+                        if isinstance(
+                            latency,
+                            (int, float),
+                        )
+                        else float("inf"),
+                        priority,
+                        server,
+                    )
+                )
+
+        mode = provider_mode()
+        forced_priority = (
+            forced_provider_priority()
+        )
+
+        selected = None
+
+        if (
+            mode == "FORCED"
+            and forced_priority
+        ):
+            forced_server = servers[
+                forced_priority - 1
+            ]
 
             if (
-                state
-                and state.get(
-                    "online"
-                ) is True
+                STATE[
+                    "servers"
+                ].get(
+                    forced_server,
+                    {},
+                ).get("online")
+                is True
             ):
-                selected = server
-                break
+                selected = forced_server
+
+            elif healthy:
+                selected = min(
+                    healthy,
+                    key=lambda item: (
+                        item[0],
+                        item[1],
+                    ),
+                )[2]
+
+        elif healthy:
+            selected = min(
+                healthy,
+                key=lambda item: (
+                    item[0],
+                    item[1],
+                ),
+            )[2]
 
         STATE[
             "active_server"
         ] = selected
+
+        STATE[
+            "provider_selection"
+        ] = {
+            "mode": mode,
+            "forced_provider_priority": (
+                forced_priority
+                if mode == "FORCED"
+                else 0
+            ),
+        }
 
     if selected == previous:
         return
@@ -1706,16 +1841,9 @@ def select_active_server():
         )
         return
 
-    priority = (
-        servers.index(
-            selected
-        )
-        + 1
-    )
-
     LOGGER.info(
         "Active provider changed to P%d",
-        priority,
+        servers.index(selected) + 1,
     )
 
 
@@ -1766,17 +1894,13 @@ def check_servers(
             LOGGER.info(
                 "P%d online (%sms)",
                 priority,
-                result[
-                    "response_time_ms"
-                ],
+                result["response_time_ms"],
             )
         else:
             LOGGER.warning(
                 "P%d offline: %s",
                 priority,
-                result[
-                    "reason"
-                ],
+                result["reason"],
             )
 
     select_active_server()
@@ -1803,7 +1927,7 @@ def check_all_servers():
 
     check_servers(
         servers,
-        "full provider check",
+        "15-minute provider health check",
     )
 
     with STATE_LOCK:
@@ -1829,120 +1953,33 @@ def get_active_provider_snapshot():
             + 1,
         )
 
-    for priority, server in enumerate(
-        servers,
-        start=1,
-    ):
-        with STATE_LOCK:
-            state = STATE[
-                "servers"
-            ].get(server)
-
-        if (
-            state
-            and state.get(
-                "online"
-            )
-        ):
-            return (
-                server,
-                priority,
-            )
-
-    return None, None
-
-
-def check_active_server():
-    servers = configured_servers()
-
-    if not servers:
-        check_all_servers()
-        return
+    select_active_server()
 
     with STATE_LOCK:
         active = STATE[
             "active_server"
         ]
 
-    if active not in servers:
-        check_all_servers()
-        return
-
-    check_servers(
-        [active],
-        "active provider check",
-    )
-
-    with STATE_LOCK:
-        current_active = STATE[
-            "active_server"
-        ]
-
-    if current_active not in servers:
-        check_all_servers()
-        return
-
-    active_index = servers.index(
-        current_active
-    )
-
-    higher_priority = servers[
-        :active_index
-    ]
-
-    if higher_priority:
-        now = time.time()
-
-        backup_interval = max(
-            60,
-            safe_int(
-                CONFIG.get(
-                    "backup_health_check_seconds"
-                ),
-                21600,
-            ),
+    if active in servers:
+        return (
+            active,
+            servers.index(
+                active
+            )
+            + 1,
         )
 
-        due = []
+    return None, None
 
-        with STATE_LOCK:
-            for server in higher_priority:
-                state = STATE[
-                    "servers"
-                ].get(
-                    server,
-                    {},
-                )
 
-                last_check = state.get(
-                    "last_check"
-                )
-
-                if (
-                    last_check is None
-                    or now - last_check
-                    >= backup_interval
-                ):
-                    due.append(
-                        server
-                    )
-
-        if due:
-            check_servers(
-                due,
-                "backup recovery check",
-            )
-
-    with STATE_LOCK:
-        STATE[
-            "last_health_check"
-        ] = now_unix()
+def check_active_server():
+    check_all_servers()
 
 
 def health_loop():
     while True:
         try:
-            check_active_server()
+            check_all_servers()
 
         except Exception as exc:
             LOGGER.error(
@@ -1950,17 +1987,17 @@ def health_loop():
                 exc,
             )
 
-        interval = max(
-            60,
-            safe_int(
-                CONFIG.get(
-                    "health_check_seconds"
+        time.sleep(
+            max(
+                60,
+                safe_int(
+                    CONFIG.get(
+                        "health_check_seconds"
+                    ),
+                    900,
                 ),
-                900,
-            ),
+            )
         )
-
-        time.sleep(interval)
 
 
 # ============================================================================
@@ -3796,6 +3833,9 @@ class StreamHubHandler(
                     "active_provider_priority": (
                         active_priority
                     ),
+                    "provider_selection": (
+                        provider_selection_state()
+                    ),
                     "providers": provider_status,
                     "last_health_check": (
                         STATE[
@@ -3844,6 +3884,68 @@ class StreamHubHandler(
                 self,
                 200,
                 payload,
+            )
+            return
+
+        # ------------------------------------------------------------
+        # PROVIDER SELECTION
+        # ------------------------------------------------------------
+
+        if path == "/provider/select":
+            priority = safe_int(
+                query.get(
+                    "priority",
+                    ["0"],
+                )[0],
+                0,
+            )
+
+            servers = configured_servers()
+
+            if priority == 0:
+                save_provider_control(
+                    "AUTO",
+                    0,
+                )
+
+            elif 1 <= priority <= len(servers):
+                save_provider_control(
+                    "FORCED",
+                    priority,
+                )
+
+            else:
+                send_json(
+                    self,
+                    400,
+                    {
+                        "status": "error",
+                        "error": "invalid_provider_priority",
+                        "valid_range": (
+                            f"0-{len(servers)}"
+                        ),
+                    },
+                )
+                return
+
+            select_active_server()
+
+            active, active_priority = (
+                get_active_provider_snapshot()
+            )
+
+            send_json(
+                self,
+                200,
+                {
+                    "status": "ok",
+                    "provider_selection": (
+                        provider_selection_state()
+                    ),
+                    "active_provider_priority": (
+                        active_priority
+                    ),
+                },
             )
             return
 
@@ -4201,6 +4303,18 @@ def start_server():
     if not SERIES_STATE_FILE.exists():
         save_series_state(
             default_series_state()
+        )
+
+    if not PROVIDER_STATE_FILE.exists():
+        save_provider_control(
+            CONFIG.get(
+                "provider_mode",
+                "AUTO",
+            ),
+            CONFIG.get(
+                "forced_provider_priority",
+                0,
+            ),
         )
 
     LOGGER.info(
