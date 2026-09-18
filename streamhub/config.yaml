@@ -1,5 +1,5 @@
 name: "StreamHub"
-version: "1.1.0"
+version: "1.2.0"
 slug: "streamhub"
 description: "Multi-provider IPTV hub with configurable content filtering, persistent caching and automatic failover."
 url: "https://github.com/robinmusch/streamhub"
