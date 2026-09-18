@@ -1,0 +1,199 @@
+name: StreamHub Validation
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  validate:
+    name: Validate StreamHub
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check Python syntax
+        run: |
+          python -m py_compile streamhub/app.py
+
+      - name: Check Python AST
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+
+          path = Path("streamhub/app.py")
+          source = path.read_text(encoding="utf-8")
+
+          ast.parse(source, filename=str(path))
+
+          print("Python AST validation: OK")
+          PY
+
+      - name: Check required files
+        run: |
+          test -f repository.yaml
+          test -f streamhub/config.yaml
+          test -f streamhub/Dockerfile
+          test -f streamhub/run.sh
+          test -f streamhub/app.py
+
+          echo "Required files: OK"
+
+      - name: Check Dockerfile
+        run: |
+          grep -q '^FROM ghcr.io/home-assistant/base:latest$' streamhub/Dockerfile
+          grep -q '^EXPOSE 8088$' streamhub/Dockerfile
+
+          echo "Dockerfile validation: OK"
+
+      - name: Check run.sh
+        run: |
+          test -f streamhub/run.sh
+          grep -q 'python3 /app/app.py' streamhub/run.sh
+
+          echo "run.sh validation: OK"
+
+      - name: Install validation dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install PyYAML
+
+      - name: Check Home Assistant configuration
+        run: |
+          python - <<'PY'
+          import yaml
+          from pathlib import Path
+
+          path = Path("streamhub/config.yaml")
+          data = yaml.safe_load(
+              path.read_text(encoding="utf-8")
+          )
+
+          if not isinstance(data, dict):
+              raise SystemExit(
+                  "config.yaml does not contain a YAML mapping"
+              )
+
+          required = [
+              "name",
+              "version",
+              "slug",
+              "description",
+              "arch",
+              "startup",
+              "boot",
+              "ports",
+              "ports_description",
+              "watchdog",
+              "options",
+              "schema",
+          ]
+
+          missing = [
+              key
+              for key in required
+              if key not in data
+          ]
+
+          if missing:
+              raise SystemExit(
+                  "Missing config keys: "
+                  + ", ".join(missing)
+              )
+
+          required_options = [
+              "public_host",
+              "servers",
+              "server_username",
+              "server_password",
+              "proxy_access_key",
+              "country_marker",
+              "tv_cache_hours",
+              "movies_cache_hours",
+              "series_cache_hours",
+              "health_check_seconds",
+              "backup_health_check_seconds",
+              "health_timeout_seconds",
+              "series_workers",
+              "series_request_delay",
+              "epg_enabled",
+              "epg_url",
+          ]
+
+          options = data.get("options", {})
+
+          missing_options = [
+              key
+              for key in required_options
+              if key not in options
+          ]
+
+          if missing_options:
+              raise SystemExit(
+                  "Missing option keys: "
+                  + ", ".join(missing_options)
+              )
+
+          schema = data.get("schema", {})
+
+          missing_schema = [
+              key
+              for key in required_options
+              if key not in schema
+          ]
+
+          if missing_schema:
+              raise SystemExit(
+                  "Missing schema keys: "
+                  + ", ".join(missing_schema)
+              )
+
+          print(
+              "Home Assistant configuration validation: OK"
+          )
+          PY
+
+      - name: Check for hardcoded provider secrets
+        run: |
+          if grep -RniE \
+            --exclude-dir=.git \
+            --exclude='validate.yml' \
+            'server_password[[:space:]]*:[[:space:]]*[^"]+|proxy_access_key[[:space:]]*:[[:space:]]*[^"]+' \
+            streamhub repository.yaml; then
+
+            echo "Possible hardcoded secret detected."
+            exit 1
+          fi
+
+          echo "Secret scan: OK"
+
+      - name: Check for provider credentials in source
+        run: |
+          if grep -RniE \
+            --exclude-dir=.git \
+            --exclude='validate.yml' \
+            'line\.[a-zA-Z0-9.-]+|mag\.[a-zA-Z0-9.-]+' \
+            .; then
+
+            echo "Possible provider URL detected in repository."
+            exit 1
+          fi
+
+          echo "Provider URL scan: OK"
+
+      - name: Validation complete
+        run: |
+          echo "======================================"
+          echo "StreamHub validation completed"
+          echo "======================================"
