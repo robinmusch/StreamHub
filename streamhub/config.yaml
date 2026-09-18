@@ -31,8 +31,9 @@ options:
 
   country_marker: "┃NL┃"
 
-  tv_cache_hours: 1
-  movies_cache_hours: 6
+  # Cacheduur is instelbaar via de Home Assistant app-configuratie.
+  tv_cache_hours: 24
+  movies_cache_hours: 12
   series_cache_hours: 12
 
   health_check_seconds: 900
