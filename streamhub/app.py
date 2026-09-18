@@ -35,23 +35,25 @@ DEFAULT_CONFIG = {
     "server_username": "",
     "server_password": "",
     "proxy_access_key": "",
-    "country_marker": "┃NL┃",
+
+    "content_filter": "ALL",
+    "custom_marker": "",
+
     "tv_cache_hours": 24,
     "movies_cache_hours": 12,
     "series_cache_hours": 12,
+
     "health_check_seconds": 900,
     "backup_health_check_seconds": 21600,
     "health_timeout_seconds": 8,
+
     "series_workers": 1,
     "series_request_delay": 1.5,
+
     "epg_enabled": True,
     "epg_url": "",
 }
 
-
-# ============================================================================
-# LOGGING
-# ============================================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -201,12 +203,150 @@ def safe_float(value, default):
 
 def cache_ttl_seconds(cache_type):
     hours = {
-        "tv": safe_int(CONFIG.get("tv_cache_hours"), 24),
-        "movies": safe_int(CONFIG.get("movies_cache_hours"), 12),
-        "series": safe_int(CONFIG.get("series_cache_hours"), 12),
+        "tv": safe_int(
+            CONFIG.get("tv_cache_hours"),
+            24,
+        ),
+        "movies": safe_int(
+            CONFIG.get("movies_cache_hours"),
+            12,
+        ),
+        "series": safe_int(
+            CONFIG.get("series_cache_hours"),
+            12,
+        ),
     }.get(cache_type, 12)
 
     return max(0, hours) * 3600
+
+
+# ============================================================================
+# CONTENT FILTER
+# ============================================================================
+
+CONTENT_MARKERS = {
+    "NL": "┃NL┃",
+    "BE": "┃BE┃",
+    "DE": "┃DE┃",
+    "FR": "┃FR┃",
+    "UK": "┃UK┃",
+    "US": "┃US┃",
+    "ES": "┃ES┃",
+    "IT": "┃IT┃",
+    "PT": "┃PT┃",
+    "TR": "┃TR┃",
+}
+
+
+def get_content_filter():
+    value = str(
+        CONFIG.get("content_filter", "ALL") or "ALL"
+    ).strip().upper()
+
+    if value not in {
+        "ALL",
+        "NL",
+        "BE",
+        "DE",
+        "FR",
+        "UK",
+        "US",
+        "ES",
+        "IT",
+        "PT",
+        "TR",
+        "CUSTOM",
+    }:
+        return "ALL"
+
+    return value
+
+
+def get_content_marker():
+    content_filter = get_content_filter()
+
+    if content_filter == "ALL":
+        return ""
+
+    if content_filter == "CUSTOM":
+        return str(
+            CONFIG.get("custom_marker", "") or ""
+        ).strip()
+
+    return CONTENT_MARKERS.get(
+        content_filter,
+        "",
+    )
+
+
+def content_filter_description():
+    content_filter = get_content_filter()
+
+    if content_filter == "ALL":
+        return {
+            "mode": "ALL",
+            "marker": "",
+        }
+
+    if content_filter == "CUSTOM":
+        return {
+            "mode": "CUSTOM",
+            "marker": get_content_marker(),
+        }
+
+    return {
+        "mode": content_filter,
+        "marker": get_content_marker(),
+    }
+
+
+def contains_content_marker(value):
+    marker = get_content_marker()
+
+    if not marker:
+        return True
+
+    return marker.casefold() in str(
+        value or ""
+    ).casefold()
+
+
+def item_matches_content(
+    item,
+    category_name="",
+):
+    if not isinstance(item, dict):
+        return False
+
+    if get_content_filter() == "ALL":
+        return True
+
+    marker = get_content_marker()
+
+    if not marker:
+        LOGGER.warning(
+            "Content filter %s selected but no marker is configured",
+            get_content_filter(),
+        )
+        return False
+
+    name = str(
+        item.get("name", "")
+        or item.get("stream_name", "")
+        or item.get("title", "")
+        or ""
+    )
+
+    category = str(
+        category_name
+        or item.get("category_name", "")
+        or ""
+    )
+
+    return (
+        contains_content_marker(name)
+        or contains_content_marker(category)
+    )
 
 
 # ============================================================================
@@ -223,15 +363,23 @@ def http_get(url, timeout):
         method="GET",
     )
 
-    with urlopen(request, timeout=timeout) as response:
+    with urlopen(
+        request,
+        timeout=timeout,
+    ) as response:
         return response.status, response.read()
 
 
 def http_get_json(url, timeout):
-    status_code, body = http_get(url, timeout)
+    status_code, body = http_get(
+        url,
+        timeout,
+    )
 
     if not 200 <= status_code < 300:
-        raise RuntimeError(f"http_{status_code}")
+        raise RuntimeError(
+            f"http_{status_code}"
+        )
 
     return json.loads(
         body.decode(
@@ -241,13 +389,25 @@ def http_get_json(url, timeout):
     )
 
 
-def xtream_url(server, action=None, extra=None):
+def xtream_url(
+    server,
+    action=None,
+    extra=None,
+):
     username = str(
-        CONFIG.get("server_username", "") or ""
+        CONFIG.get(
+            "server_username",
+            "",
+        )
+        or ""
     )
 
     password = str(
-        CONFIG.get("server_password", "") or ""
+        CONFIG.get(
+            "server_password",
+            "",
+        )
+        or ""
     )
 
     url = (
@@ -257,11 +417,16 @@ def xtream_url(server, action=None, extra=None):
     )
 
     if action:
-        url += f"&action={quote(action)}"
+        url += (
+            f"&action={quote(str(action))}"
+        )
 
     if extra:
         for key, value in extra.items():
-            url += f"&{quote(str(key))}={quote(str(value))}"
+            url += (
+                f"&{quote(str(key))}"
+                f"={quote(str(value))}"
+            )
 
     return url
 
@@ -270,7 +435,9 @@ def provider_timeout():
     return max(
         1,
         safe_int(
-            CONFIG.get("health_timeout_seconds"),
+            CONFIG.get(
+                "health_timeout_seconds"
+            ),
             8,
         ),
     )
@@ -282,14 +449,20 @@ def provider_timeout():
 
 def check_xtream_server(server):
     username = str(
-        CONFIG.get("server_username", "") or ""
+        CONFIG.get(
+            "server_username",
+            "",
+        )
+        or ""
     )
 
     password = str(
-        CONFIG.get("server_password", "") or ""
+        CONFIG.get(
+            "server_password",
+            "",
+        )
+        or ""
     )
-
-    timeout = provider_timeout()
 
     if not username or not password:
         return {
@@ -298,14 +471,12 @@ def check_xtream_server(server):
             "response_time_ms": None,
         }
 
-    url = xtream_url(server)
-
     started = time.monotonic()
 
     try:
         status_code, body = http_get(
-            url,
-            timeout,
+            xtream_url(server),
+            provider_timeout(),
         )
 
         elapsed_ms = round(
@@ -336,7 +507,10 @@ def check_xtream_server(server):
 
         user_info = data.get("user_info")
 
-        if not isinstance(user_info, dict):
+        if not isinstance(
+            user_info,
+            dict,
+        ):
             return {
                 "online": False,
                 "reason": "invalid_xtream_response",
@@ -353,7 +527,10 @@ def check_xtream_server(server):
             }
 
         account_status = str(
-            user_info.get("status", "")
+            user_info.get(
+                "status",
+                "",
+            )
         ).lower()
 
         if account_status and account_status not in {
@@ -399,7 +576,9 @@ def check_xtream_server(server):
 
         return {
             "online": False,
-            "reason": str(reason or "connection_error"),
+            "reason": str(
+                reason or "connection_error"
+            ),
             "response_time_ms": elapsed_ms,
         }
 
@@ -416,7 +595,10 @@ def check_xtream_server(server):
         }
 
 
-def update_server_state(server, result):
+def update_server_state(
+    server,
+    result,
+):
     with STATE_LOCK:
         state = STATE["servers"].setdefault(
             server,
@@ -430,9 +612,13 @@ def update_server_state(server, result):
 
         state.update(
             {
-                "online": bool(result["online"]),
+                "online": bool(
+                    result["online"]
+                ),
                 "reason": result["reason"],
-                "response_time_ms": result["response_time_ms"],
+                "response_time_ms": (
+                    result["response_time_ms"]
+                ),
                 "last_check": now_unix(),
             }
         )
@@ -446,9 +632,14 @@ def select_active_server():
         selected = None
 
         for server in servers:
-            state = STATE["servers"].get(server)
+            state = STATE["servers"].get(
+                server
+            )
 
-            if state and state.get("online") is True:
+            if (
+                state
+                and state.get("online") is True
+            ):
                 selected = server
                 break
 
@@ -463,7 +654,9 @@ def select_active_server():
         )
         return
 
-    priority = servers.index(selected) + 1
+    priority = (
+        servers.index(selected) + 1
+    )
 
     LOGGER.info(
         "Active provider changed to P%d",
@@ -472,7 +665,9 @@ def select_active_server():
 
 
 def check_provider(server):
-    result = check_xtream_server(server)
+    result = check_xtream_server(
+        server
+    )
 
     update_server_state(
         server,
@@ -482,7 +677,10 @@ def check_provider(server):
     return result
 
 
-def check_servers(servers, reason):
+def check_servers(
+    servers,
+    reason,
+):
     if not servers:
         return
 
@@ -496,7 +694,9 @@ def check_servers(servers, reason):
 
     for server in servers:
         try:
-            priority = configured.index(server) + 1
+            priority = (
+                configured.index(server) + 1
+            )
         except ValueError:
             priority = None
 
@@ -507,7 +707,9 @@ def check_servers(servers, reason):
                 LOGGER.info(
                     "P%d online (%sms)",
                     priority,
-                    result["response_time_ms"],
+                    result[
+                        "response_time_ms"
+                    ],
                 )
         else:
             if priority is not None:
@@ -526,7 +728,9 @@ def check_all_servers():
     if not servers:
         with STATE_LOCK:
             STATE["active_server"] = None
-            STATE["last_health_check"] = now_unix()
+            STATE["last_health_check"] = (
+                now_unix()
+            )
 
         LOGGER.warning(
             "No IPTV providers configured"
@@ -539,7 +743,9 @@ def check_all_servers():
     )
 
     with STATE_LOCK:
-        STATE["last_health_check"] = now_unix()
+        STATE["last_health_check"] = (
+            now_unix()
+        )
 
 
 def check_active_server():
@@ -562,14 +768,21 @@ def check_active_server():
     )
 
     with STATE_LOCK:
-        current_active = STATE["active_server"]
+        current_active = STATE[
+            "active_server"
+        ]
 
     if current_active not in servers:
         check_all_servers()
         return
 
-    active_index = servers.index(current_active)
-    higher_priority = servers[:active_index]
+    active_index = servers.index(
+        current_active
+    )
+
+    higher_priority = servers[
+        :active_index
+    ]
 
     if higher_priority:
         now = time.time()
@@ -588,7 +801,9 @@ def check_active_server():
 
         with STATE_LOCK:
             for server in higher_priority:
-                state = STATE["servers"].get(
+                state = STATE[
+                    "servers"
+                ].get(
                     server,
                     {},
                 )
@@ -599,7 +814,8 @@ def check_active_server():
 
                 if (
                     last_check is None
-                    or now - last_check >= backup_interval
+                    or now - last_check
+                    >= backup_interval
                 ):
                     due.append(server)
 
@@ -610,7 +826,9 @@ def check_active_server():
             )
 
     with STATE_LOCK:
-        STATE["last_health_check"] = now_unix()
+        STATE["last_health_check"] = (
+            now_unix()
+        )
 
 
 def health_loop():
@@ -638,17 +856,22 @@ def health_loop():
 
 
 # ============================================================================
-# CACHE HELPERS
+# CACHE
 # ============================================================================
 
-def atomic_write_json(path, payload):
+def atomic_write_json(
+    path,
+    payload,
+):
     path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
     temporary = path.with_name(
-        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        f".{path.name}."
+        f"{os.getpid()}."
+        f"{threading.get_ident()}.tmp"
     )
 
     try:
@@ -662,8 +885,11 @@ def atomic_write_json(path, payload):
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
+
             file.flush()
-            os.fsync(file.fileno())
+            os.fsync(
+                file.fileno()
+            )
 
         os.replace(
             temporary,
@@ -700,12 +926,20 @@ def read_json_file(path):
 
 
 def cache_age_seconds(payload):
-    if not isinstance(payload, dict):
+    if not isinstance(
+        payload,
+        dict,
+    ):
         return None
 
-    created_at = payload.get("created_at")
+    created_at = payload.get(
+        "created_at"
+    )
 
-    if not isinstance(created_at, (int, float)):
+    if not isinstance(
+        created_at,
+        (int, float),
+    ):
         return None
 
     return max(
@@ -714,28 +948,44 @@ def cache_age_seconds(payload):
     )
 
 
-def cache_is_fresh(cache_type):
-    path = CACHE_FILES[cache_type]
-    payload = read_json_file(path)
+def cache_is_fresh(
+    cache_type,
+):
+    payload = read_json_file(
+        CACHE_FILES[cache_type]
+    )
 
-    if not isinstance(payload, dict):
+    if not isinstance(
+        payload,
+        dict,
+    ):
         return False
 
-    age = cache_age_seconds(payload)
+    age = cache_age_seconds(
+        payload
+    )
 
     if age is None:
         return False
 
-    return age <= cache_ttl_seconds(
-        cache_type
+    return (
+        age <= cache_ttl_seconds(
+            cache_type
+        )
     )
 
 
-def cache_status(cache_type):
-    path = CACHE_FILES[cache_type]
-    payload = read_json_file(path)
+def cache_status(
+    cache_type,
+):
+    payload = read_json_file(
+        CACHE_FILES[cache_type]
+    )
 
-    if not isinstance(payload, dict):
+    if not isinstance(
+        payload,
+        dict,
+    ):
         return {
             "exists": False,
             "fresh": False,
@@ -745,27 +995,37 @@ def cache_status(cache_type):
             "provider_priority": None,
         }
 
-    age = cache_age_seconds(payload)
+    age = cache_age_seconds(
+        payload
+    )
+
+    items = payload.get(
+        "items",
+        [],
+    )
 
     return {
         "exists": True,
         "fresh": (
             age is not None
-            and age <= cache_ttl_seconds(cache_type)
+            and age
+            <= cache_ttl_seconds(
+                cache_type
+            )
         ),
         "age_seconds": (
             round(age, 1)
             if age is not None
             else None
         ),
-        "items": len(
-            payload.get("items", [])
-        )
-        if isinstance(
-            payload.get("items", []),
-            list,
-        )
-        else 0,
+        "items": (
+            len(items)
+            if isinstance(
+                items,
+                list,
+            )
+            else 0
+        ),
         "created_at": payload.get(
             "created_at"
         ),
@@ -785,11 +1045,8 @@ def write_cache(
         "type": cache_type,
         "created_at": now_unix(),
         "provider_priority": provider_priority,
-        "marker": str(
-            CONFIG.get(
-                "country_marker",
-                "┃NL┃",
-            )
+        "content_filter": (
+            content_filter_description()
         ),
         "items": items,
     }
@@ -801,55 +1058,7 @@ def write_cache(
 
 
 # ============================================================================
-# NL FILTERING
-# ============================================================================
-
-def country_marker():
-    return str(
-        CONFIG.get(
-            "country_marker",
-            "┃NL┃",
-        )
-        or "┃NL┃"
-    ).strip()
-
-
-def contains_country_marker(value):
-    marker = country_marker()
-
-    if not marker:
-        return True
-
-    return marker.casefold() in str(
-        value or ""
-    ).casefold()
-
-
-def item_matches_country(item, category_name=""):
-    if not isinstance(item, dict):
-        return False
-
-    name = str(
-        item.get("name", "")
-        or item.get("stream_name", "")
-        or item.get("title", "")
-        or ""
-    )
-
-    category = str(
-        category_name
-        or item.get("category_name", "")
-        or ""
-    )
-
-    return (
-        contains_country_marker(name)
-        or contains_country_marker(category)
-    )
-
-
-# ============================================================================
-# XTREAM DATA
+# XTREAM
 # ============================================================================
 
 def get_active_provider_snapshot():
@@ -859,17 +1068,28 @@ def get_active_provider_snapshot():
         active = STATE["active_server"]
 
     if active in servers:
-        return active, servers.index(active) + 1
+        return (
+            active,
+            servers.index(active) + 1,
+        )
 
     for priority, server in enumerate(
         servers,
         start=1,
     ):
         with STATE_LOCK:
-            state = STATE["servers"].get(server)
+            state = STATE[
+                "servers"
+            ].get(server)
 
-        if state and state.get("online"):
-            return server, priority
+        if (
+            state
+            and state.get("online")
+        ):
+            return (
+                server,
+                priority,
+            )
 
     return None, None
 
@@ -890,25 +1110,40 @@ def fetch_xtream_action(
 
 
 def as_list(value):
-    return value if isinstance(value, list) else []
+    return (
+        value
+        if isinstance(value, list)
+        else []
+    )
 
 
 def category_map(categories):
     result = {}
 
-    for category in as_list(categories):
-        if not isinstance(category, dict):
+    for category in as_list(
+        categories
+    ):
+        if not isinstance(
+            category,
+            dict,
+        ):
             continue
 
         category_id = str(
-            category.get("category_id", "")
+            category.get(
+                "category_id",
+                "",
+            )
         )
 
         if not category_id:
             continue
 
         result[category_id] = str(
-            category.get("category_name", "")
+            category.get(
+                "category_name",
+                "",
+            )
             or ""
         )
 
@@ -921,15 +1156,22 @@ def normalize_item(
     category_name,
     provider_priority,
 ):
-    if not isinstance(item, dict):
+    if not isinstance(
+        item,
+        dict,
+    ):
         return None
 
     normalized = dict(item)
 
     normalized["_streamhub"] = {
         "type": cache_type,
-        "provider_priority": provider_priority,
-        "category_name": category_name,
+        "provider_priority": (
+            provider_priority
+        ),
+        "category_name": (
+            category_name
+        ),
         "cached_at": now_unix(),
     }
 
@@ -941,7 +1183,10 @@ def deduplicate_items(items):
     seen = set()
 
     for item in items:
-        if not isinstance(item, dict):
+        if not isinstance(
+            item,
+            dict,
+        ):
             continue
 
         stream_id = (
@@ -975,7 +1220,9 @@ def deduplicate_items(items):
 # ============================================================================
 
 def build_tv_cache():
-    server, priority = get_active_provider_snapshot()
+    server, priority = (
+        get_active_provider_snapshot()
+    )
 
     if not server:
         raise RuntimeError(
@@ -998,17 +1245,23 @@ def build_tv_cache():
 
     items = []
 
-    for category_id, category_name in category_names.items():
+    for (
+        category_id,
+        category_name,
+    ) in category_names.items():
+
         streams = fetch_xtream_action(
             server,
             "get_live_streams",
             {
-                "category_id": category_id,
+                "category_id": category_id
             },
         )
 
-        for stream in as_list(streams):
-            if not item_matches_country(
+        for stream in as_list(
+            streams
+        ):
+            if not item_matches_content(
                 stream,
                 category_name,
             ):
@@ -1022,13 +1275,17 @@ def build_tv_cache():
             )
 
             if normalized:
-                items.append(normalized)
+                items.append(
+                    normalized
+                )
 
-    items = deduplicate_items(items)
+    items = deduplicate_items(
+        items
+    )
 
     if not items:
         raise RuntimeError(
-            "no_nl_tv_items"
+            "no_matching_tv_items"
         )
 
     write_cache(
@@ -1050,7 +1307,9 @@ def build_tv_cache():
 # ============================================================================
 
 def build_movies_cache():
-    server, priority = get_active_provider_snapshot()
+    server, priority = (
+        get_active_provider_snapshot()
+    )
 
     if not server:
         raise RuntimeError(
@@ -1073,17 +1332,23 @@ def build_movies_cache():
 
     items = []
 
-    for category_id, category_name in category_names.items():
+    for (
+        category_id,
+        category_name,
+    ) in category_names.items():
+
         streams = fetch_xtream_action(
             server,
             "get_vod_streams",
             {
-                "category_id": category_id,
+                "category_id": category_id
             },
         )
 
-        for stream in as_list(streams):
-            if not item_matches_country(
+        for stream in as_list(
+            streams
+        ):
+            if not item_matches_content(
                 stream,
                 category_name,
             ):
@@ -1097,13 +1362,17 @@ def build_movies_cache():
             )
 
             if normalized:
-                items.append(normalized)
+                items.append(
+                    normalized
+                )
 
-    items = deduplicate_items(items)
+    items = deduplicate_items(
+        items
+    )
 
     if not items:
         raise RuntimeError(
-            "no_nl_movie_items"
+            "no_matching_movie_items"
         )
 
     write_cache(
@@ -1130,7 +1399,9 @@ def fetch_series_detail(
     series,
     delay,
 ):
-    series_id = series.get("series_id")
+    series_id = series.get(
+        "series_id"
+    )
 
     if series_id is None:
         return None
@@ -1143,25 +1414,31 @@ def fetch_series_detail(
             server,
             "get_series_info",
             {
-                "series_id": series_id,
+                "series_id": series_id
             },
         )
 
         result = dict(series)
 
-        result["info"] = details.get(
-            "info",
-            {},
+        result["info"] = (
+            details.get(
+                "info",
+                {},
+            )
         )
 
-        result["episodes"] = details.get(
-            "episodes",
-            {},
+        result["episodes"] = (
+            details.get(
+                "episodes",
+                {},
+            )
         )
 
         result["_streamhub"] = {
             "type": "series",
-            "provider_priority": priority,
+            "provider_priority": (
+                priority
+            ),
             "cached_at": now_unix(),
         }
 
@@ -1177,7 +1454,9 @@ def fetch_series_detail(
 
 
 def build_series_cache():
-    server, priority = get_active_provider_snapshot()
+    server, priority = (
+        get_active_provider_snapshot()
+    )
 
     if not server:
         raise RuntimeError(
@@ -1200,17 +1479,23 @@ def build_series_cache():
 
     series_items = []
 
-    for category_id, category_name in category_names.items():
+    for (
+        category_id,
+        category_name,
+    ) in category_names.items():
+
         series_list = fetch_xtream_action(
             server,
             "get_series",
             {
-                "category_id": category_id,
+                "category_id": category_id
             },
         )
 
-        for series in as_list(series_list):
-            if not item_matches_country(
+        for series in as_list(
+            series_list
+        ):
+            if not item_matches_content(
                 series,
                 category_name,
             ):
@@ -1234,7 +1519,7 @@ def build_series_cache():
 
     if not series_items:
         raise RuntimeError(
-            "no_nl_series_items"
+            "no_matching_series_items"
         )
 
     workers = max(
@@ -1264,6 +1549,7 @@ def build_series_cache():
     with ThreadPoolExecutor(
         max_workers=workers
     ) as executor:
+
         futures = [
             executor.submit(
                 fetch_series_detail,
@@ -1275,12 +1561,16 @@ def build_series_cache():
             for series in series_items
         ]
 
-        for future in as_completed(futures):
+        for future in as_completed(
+            futures
+        ):
             try:
                 result = future.result()
 
                 if result:
-                    results.append(result)
+                    results.append(
+                        result
+                    )
 
             except Exception as exc:
                 LOGGER.warning(
@@ -1315,7 +1605,9 @@ def build_series_cache():
 # CACHE REFRESH
 # ============================================================================
 
-def refresh_cache_type(cache_type):
+def refresh_cache_type(
+    cache_type
+):
     if cache_type == "tv":
         return build_tv_cache()
 
@@ -1331,7 +1623,9 @@ def refresh_cache_type(cache_type):
 
 
 def refresh_all_caches():
-    if not CACHE_LOCK.acquire(blocking=False):
+    if not CACHE_LOCK.acquire(
+        blocking=False
+    ):
         LOGGER.info(
             "Cache refresh already running"
         )
@@ -1339,7 +1633,9 @@ def refresh_all_caches():
 
     with STATE_LOCK:
         STATE["refresh_running"] = True
-        STATE["last_refresh_started"] = now_unix()
+        STATE["last_refresh_started"] = (
+            now_unix()
+        )
         STATE["last_refresh_error"] = None
 
     LOGGER.info(
@@ -1361,7 +1657,8 @@ def refresh_all_caches():
 
             except Exception as exc:
                 errors.append(
-                    f"{cache_type}:{type(exc).__name__}"
+                    f"{cache_type}:"
+                    f"{type(exc).__name__}"
                 )
 
                 LOGGER.error(
@@ -1371,7 +1668,9 @@ def refresh_all_caches():
                 )
 
         with STATE_LOCK:
-            STATE["last_refresh_finished"] = now_unix()
+            STATE["last_refresh_finished"] = (
+                now_unix()
+            )
 
             if errors:
                 STATE["last_refresh_error"] = (
@@ -1415,17 +1714,23 @@ def prewarm_thread():
 
 
 # ============================================================================
-# API RESPONSES
+# API
 # ============================================================================
 
-def send_json(handler, status_code, payload):
+def send_json(
+    handler,
+    status_code,
+    payload,
+):
     body = json.dumps(
         payload,
         ensure_ascii=False,
         indent=2,
     ).encode("utf-8")
 
-    handler.send_response(status_code)
+    handler.send_response(
+        status_code
+    )
 
     handler.send_header(
         "Content-Type",
@@ -1448,15 +1753,19 @@ def send_json(handler, status_code, payload):
         handler.wfile.write(body)
 
 
-# ============================================================================
-# HTTP API
-# ============================================================================
+class StreamHubHandler(
+    BaseHTTPRequestHandler
+):
 
-class StreamHubHandler(BaseHTTPRequestHandler):
+    server_version = (
+        "StreamHub/1.0.0"
+    )
 
-    server_version = "StreamHub/1.0.0"
-
-    def log_message(self, format_string, *args):
+    def log_message(
+        self,
+        format_string,
+        *args,
+    ):
         LOGGER.info(
             "%s - %s",
             self.address_string(),
@@ -1464,7 +1773,9 @@ class StreamHubHandler(BaseHTTPRequestHandler):
         )
 
     def do_HEAD(self):
-        parsed = urlparse(self.path)
+        parsed = urlparse(
+            self.path
+        )
 
         if parsed.path == "/health":
             self.send_response(200)
@@ -1481,14 +1792,16 @@ class StreamHubHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        parsed = urlparse(self.path)
+        parsed = urlparse(
+            self.path
+        )
+
         path = parsed.path
-        query = parse_qs(parsed.query)
+        query = parse_qs(
+            parsed.query
+        )
 
-        # ------------------------------------------------------------------
         # Home Assistant watchdog
-        # ------------------------------------------------------------------
-
         if path == "/health":
             send_json(
                 self,
@@ -1499,13 +1812,9 @@ class StreamHubHandler(BaseHTTPRequestHandler):
                     "version": APP_VERSION,
                 },
             )
-
             return
 
-        # ------------------------------------------------------------------
-        # Authentication
-        # ------------------------------------------------------------------
-
+        # API authentication
         if not is_authorized(query):
             send_json(
                 self,
@@ -1515,13 +1824,9 @@ class StreamHubHandler(BaseHTTPRequestHandler):
                     "error": "unauthorized",
                 },
             )
-
             return
 
-        # ------------------------------------------------------------------
         # Root
-        # ------------------------------------------------------------------
-
         if path == "/":
             send_json(
                 self,
@@ -1530,21 +1835,24 @@ class StreamHubHandler(BaseHTTPRequestHandler):
                     "application": APP_NAME,
                     "version": APP_VERSION,
                     "status": "running",
-                    "public_host": get_public_base_url(self),
+                    "public_host": (
+                        get_public_base_url(self)
+                    ),
+                    "content_filter": (
+                        content_filter_description()
+                    ),
                     "active_provider": (
                         "configured"
-                        if STATE["active_server"]
+                        if STATE[
+                            "active_server"
+                        ]
                         else None
                     ),
                 },
             )
-
             return
 
-        # ------------------------------------------------------------------
         # Status
-        # ------------------------------------------------------------------
-
         if path == "/status":
             servers = configured_servers()
 
@@ -1555,11 +1863,15 @@ class StreamHubHandler(BaseHTTPRequestHandler):
                     servers,
                     start=1,
                 ):
-                    state = STATE["servers"].get(
+                    state = STATE[
+                        "servers"
+                    ].get(
                         server,
                         {
                             "online": False,
-                            "reason": "not_checked",
+                            "reason": (
+                                "not_checked"
+                            ),
                             "response_time_ms": None,
                             "last_check": None,
                         },
@@ -1568,15 +1880,23 @@ class StreamHubHandler(BaseHTTPRequestHandler):
                     provider_status.append(
                         {
                             "priority": priority,
-                            "online": state["online"],
+                            "online": state[
+                                "online"
+                            ],
                             "active": (
                                 server
-                                == STATE["active_server"]
+                                == STATE[
+                                    "active_server"
+                                ]
                             ),
-                            "response_time_ms": state[
-                                "response_time_ms"
+                            "response_time_ms": (
+                                state[
+                                    "response_time_ms"
+                                ]
+                            ),
+                            "reason": state[
+                                "reason"
                             ],
-                            "reason": state["reason"],
                             "last_check": state[
                                 "last_check"
                             ],
@@ -1585,10 +1905,17 @@ class StreamHubHandler(BaseHTTPRequestHandler):
 
                 active_priority = None
 
-                if STATE["active_server"] in servers:
+                if (
+                    STATE[
+                        "active_server"
+                    ]
+                    in servers
+                ):
                     active_priority = (
                         servers.index(
-                            STATE["active_server"]
+                            STATE[
+                                "active_server"
+                            ]
                         )
                         + 1
                     )
@@ -1596,20 +1923,35 @@ class StreamHubHandler(BaseHTTPRequestHandler):
                 payload = {
                     "application": APP_NAME,
                     "version": APP_VERSION,
-                    "public_host": get_public_base_url(
-                        self
+                    "public_host": (
+                        get_public_base_url(
+                            self
+                        )
+                    ),
+                    "content_filter": (
+                        content_filter_description()
                     ),
                     "active_provider_priority": (
                         active_priority
                     ),
-                    "providers": provider_status,
-                    "last_health_check": STATE[
-                        "last_health_check"
-                    ],
+                    "providers": (
+                        provider_status
+                    ),
+                    "last_health_check": (
+                        STATE[
+                            "last_health_check"
+                        ]
+                    ),
                     "cache": {
-                        "tv": cache_status("tv"),
-                        "movies": cache_status("movies"),
-                        "series": cache_status("series"),
+                        "tv": cache_status(
+                            "tv"
+                        ),
+                        "movies": cache_status(
+                            "movies"
+                        ),
+                        "series": cache_status(
+                            "series"
+                        ),
                     },
                     "refresh": {
                         "running": STATE[
@@ -1632,17 +1974,15 @@ class StreamHubHandler(BaseHTTPRequestHandler):
                 200,
                 payload,
             )
-
             return
 
-        # ------------------------------------------------------------------
         # Manual provider check
-        # ------------------------------------------------------------------
-
         if path == "/check-servers":
             thread = threading.Thread(
                 target=check_all_servers,
-                name="streamhub-manual-health-check",
+                name=(
+                    "streamhub-manual-health-check"
+                ),
                 daemon=True,
             )
 
@@ -1658,13 +1998,9 @@ class StreamHubHandler(BaseHTTPRequestHandler):
                     ),
                 },
             )
-
             return
 
-        # ------------------------------------------------------------------
         # Manual cache refresh
-        # ------------------------------------------------------------------
-
         if path == "/refresh":
             with STATE_LOCK:
                 already_running = STATE[
@@ -1682,12 +2018,13 @@ class StreamHubHandler(BaseHTTPRequestHandler):
                         ),
                     },
                 )
-
                 return
 
             thread = threading.Thread(
                 target=refresh_all_caches,
-                name="streamhub-manual-cache-refresh",
+                name=(
+                    "streamhub-manual-cache-refresh"
+                ),
                 daemon=True,
             )
 
@@ -1703,30 +2040,28 @@ class StreamHubHandler(BaseHTTPRequestHandler):
                     ),
                 },
             )
-
             return
 
-        # ------------------------------------------------------------------
         # Cache status
-        # ------------------------------------------------------------------
-
         if path == "/cache":
             send_json(
                 self,
                 200,
                 {
-                    "tv": cache_status("tv"),
-                    "movies": cache_status("movies"),
-                    "series": cache_status("series"),
+                    "tv": cache_status(
+                        "tv"
+                    ),
+                    "movies": cache_status(
+                        "movies"
+                    ),
+                    "series": cache_status(
+                        "series"
+                    ),
                 },
             )
-
             return
 
-        # ------------------------------------------------------------------
         # Unknown endpoint
-        # ------------------------------------------------------------------
-
         send_json(
             self,
             404,
@@ -1763,6 +2098,21 @@ def start_server():
         "Persistent cache directory: %s",
         CACHE_DIR,
     )
+
+    filter_info = (
+        content_filter_description()
+    )
+
+    if filter_info["mode"] == "ALL":
+        LOGGER.info(
+            "Content filter: ALL"
+        )
+    else:
+        LOGGER.info(
+            "Content filter: %s (%s)",
+            filter_info["mode"],
+            filter_info["marker"],
+        )
 
     if CONFIG.get("public_host"):
         LOGGER.info(
