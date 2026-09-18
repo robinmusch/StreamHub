@@ -15,19 +15,19 @@ from urllib.request import Request, urlopen
 
 
 APP_NAME = "StreamHub"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 HOST = "0.0.0.0"
 PORT = 8088
 
 OPTIONS_FILE = Path("/data/options.json")
 CACHE_DIR = Path("/data/cache")
+SERIES_STATE_FILE = Path("/data/series_state.json")
 
 CACHE_FILES = {
     "tv": CACHE_DIR / "tv.json",
     "movies": CACHE_DIR / "movies.json",
     "series": CACHE_DIR / "series.json",
-    "metadata": CACHE_DIR / "metadata.json",
 }
 
 
@@ -96,7 +96,7 @@ LOGGER = logging.getLogger(APP_NAME)
 
 
 # ============================================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================================
 
 def load_config():
@@ -126,18 +126,13 @@ CONFIG = load_config()
 
 
 def normalize_server(server):
-    value = str(
-        server or ""
-    ).strip()
+    value = str(server or "").strip()
 
     if not value:
         return ""
 
     if not value.startswith(
-        (
-            "http://",
-            "https://",
-        )
+        ("http://", "https://")
     ):
         value = "http://" + value
 
@@ -145,54 +140,32 @@ def normalize_server(server):
 
 
 def configured_servers():
-    configured = CONFIG.get(
-        "servers",
-        [],
-    )
+    configured = CONFIG.get("servers", [])
 
-    if not isinstance(
-        configured,
-        list,
-    ):
+    if not isinstance(configured, list):
         return []
 
     result = []
 
     for server in configured:
-        normalized = normalize_server(
-            server
-        )
+        normalized = normalize_server(server)
 
-        if (
-            normalized
-            and normalized not in result
-        ):
+        if normalized and normalized not in result:
             result.append(normalized)
 
     return result
 
 
-def get_public_base_url(
-    request=None,
-):
+def get_public_base_url(request=None):
     configured = str(
-        CONFIG.get(
-            "public_host",
-            "",
-        )
-        or ""
+        CONFIG.get("public_host", "") or ""
     ).strip()
 
     if configured:
         if not configured.startswith(
-            (
-                "http://",
-                "https://",
-            )
+            ("http://", "https://")
         ):
-            configured = (
-                "https://" + configured
-            )
+            configured = "https://" + configured
 
         return configured.rstrip("/")
 
@@ -203,7 +176,20 @@ def get_public_base_url(
         ).strip()
 
         if host:
-            return f"http://{host}".rstrip("/")
+            forwarded_proto = request.headers.get(
+                "X-Forwarded-Proto",
+                "http",
+            ).split(",")[0].strip()
+
+            if forwarded_proto not in (
+                "http",
+                "https",
+            ):
+                forwarded_proto = "http"
+
+            return (
+                f"{forwarded_proto}://{host}"
+            ).rstrip("/")
 
     return ""
 
@@ -249,34 +235,20 @@ def is_authorized(query):
 
 
 def now_unix():
-    return int(
-        time.time()
-    )
+    return int(time.time())
 
 
-def safe_int(
-    value,
-    default,
-):
+def safe_int(value, default):
     try:
         return int(value)
-    except (
-        TypeError,
-        ValueError,
-    ):
+    except (TypeError, ValueError):
         return default
 
 
-def safe_float(
-    value,
-    default,
-):
+def safe_float(value, default):
     try:
         return float(value)
-    except (
-        TypeError,
-        ValueError,
-    ):
+    except (TypeError, ValueError):
         return default
 
 
@@ -292,9 +264,7 @@ def provider_timeout():
     )
 
 
-def cache_ttl_seconds(
-    cache_type,
-):
+def cache_ttl_seconds(cache_type):
     hours = {
         "tv": safe_int(
             CONFIG.get(
@@ -319,10 +289,7 @@ def cache_ttl_seconds(
         12,
     )
 
-    return max(
-        0,
-        hours,
-    ) * 3600
+    return max(0, hours) * 3600
 
 
 # ============================================================================
@@ -345,9 +312,7 @@ def get_content_filter():
 
 
 def get_content_marker():
-    content_filter = (
-        get_content_filter()
-    )
+    content_filter = get_content_filter()
 
     if content_filter == "ALL":
         return ""
@@ -368,17 +333,13 @@ def get_content_marker():
 
 
 def content_filter_description():
-    mode = get_content_filter()
-
     return {
-        "mode": mode,
+        "mode": get_content_filter(),
         "marker": get_content_marker(),
     }
 
 
-def contains_content_marker(
-    value,
-):
+def contains_content_marker(value):
     marker = get_content_marker()
 
     if not marker:
@@ -386,9 +347,7 @@ def contains_content_marker(
 
     return (
         marker.casefold()
-        in str(
-            value or ""
-        ).casefold()
+        in str(value or "").casefold()
     )
 
 
@@ -396,10 +355,7 @@ def item_matches_content(
     item,
     category_name="",
 ):
-    if not isinstance(
-        item,
-        dict,
-    ):
+    if not isinstance(item, dict):
         return False
 
     if get_content_filter() == "ALL":
@@ -408,44 +364,24 @@ def item_matches_content(
     marker = get_content_marker()
 
     if not marker:
-        LOGGER.warning(
-            "Content filter %s has no marker",
-            get_content_filter(),
-        )
         return False
 
     name = str(
-        item.get(
-            "name",
-            "",
-        )
-        or item.get(
-            "stream_name",
-            "",
-        )
-        or item.get(
-            "title",
-            "",
-        )
+        item.get("name", "")
+        or item.get("stream_name", "")
+        or item.get("title", "")
         or ""
     )
 
     category = str(
         category_name
-        or item.get(
-            "category_name",
-            "",
-        )
+        or item.get("category_name", "")
         or ""
     )
 
     return (
-        contains_content_marker(
-            name
-        )
-        or contains_content_marker(
-            category
-        )
+        contains_content_marker(name)
+        or contains_content_marker(category)
     )
 
 
@@ -469,7 +405,7 @@ STATE = {
 
 
 # ============================================================================
-# FILE / CACHE HELPERS
+# FILE HELPERS
 # ============================================================================
 
 def ensure_directories():
@@ -479,10 +415,7 @@ def ensure_directories():
     )
 
 
-def atomic_write_json(
-    path,
-    payload,
-):
+def atomic_write_json(path, payload):
     path.parent.mkdir(
         parents=True,
         exist_ok=True,
@@ -503,16 +436,11 @@ def atomic_write_json(
                 payload,
                 file,
                 ensure_ascii=False,
-                separators=(
-                    ",",
-                    ":",
-                ),
+                indent=2,
             )
 
             file.flush()
-            os.fsync(
-                file.fileno()
-            )
+            os.fsync(file.fileno())
 
         os.replace(
             temporary,
@@ -527,9 +455,7 @@ def atomic_write_json(
             pass
 
 
-def read_json_file(
-    path,
-):
+def read_json_file(path):
     if not path.exists():
         return None
 
@@ -542,17 +468,669 @@ def read_json_file(
 
     except Exception as exc:
         LOGGER.warning(
-            "Unable to read cache %s: %s",
-            path.name,
+            "Unable to read %s: %s",
+            path,
             exc,
         )
 
         return None
 
 
-def load_cache_items(
-    cache_type,
+# ============================================================================
+# SERIES STATE
+# ============================================================================
+
+def default_series_state():
+    return {
+        "version": 1,
+        "updated_at": now_unix(),
+        "watchlist": [],
+        "series": {},
+    }
+
+
+def load_series_state():
+    payload = read_json_file(
+        SERIES_STATE_FILE
+    )
+
+    if not isinstance(payload, dict):
+        payload = default_series_state()
+
+    if not isinstance(
+        payload.get("watchlist"),
+        list,
+    ):
+        payload["watchlist"] = []
+
+    if not isinstance(
+        payload.get("series"),
+        dict,
+    ):
+        payload["series"] = {}
+
+    if "version" not in payload:
+        payload["version"] = 1
+
+    return payload
+
+
+def save_series_state(state):
+    state["updated_at"] = now_unix()
+
+    atomic_write_json(
+        SERIES_STATE_FILE,
+        state,
+    )
+
+
+def series_state_key(item):
+    """
+    Provider-onafhankelijke serie-ID.
+
+    De provider stream_id/series_id wordt hier bewust NIET gebruikt.
+    Hierdoor blijft dezelfde serie herkenbaar wanneer StreamHub
+    van provider wisselt.
+    """
+
+    name = normalize_identity_text(
+        item.get(
+            "name",
+            "",
+        )
+        or item.get(
+            "title",
+            "",
+        )
+    )
+
+    category = normalize_identity_text(
+        item.get(
+            "_streamhub",
+            {},
+        ).get(
+            "category_name",
+            "",
+        )
+    )
+
+    raw = (
+        "series|"
+        + name
+        + "|"
+        + category
+    )
+
+    return hashlib.sha256(
+        raw.encode("utf-8")
+    ).hexdigest()[:20]
+
+
+def episode_state_key(
+    series_item,
+    episode,
 ):
+    series_id = series_state_key(
+        series_item
+    )
+
+    season = safe_int(
+        episode.get(
+            "season",
+            0,
+        ),
+        0,
+    )
+
+    episode_number = safe_int(
+        episode.get(
+            "episode_num",
+            episode.get(
+                "episode_number",
+                0,
+            ),
+        ),
+        0,
+    )
+
+    title = normalize_identity_text(
+        episode.get(
+            "title",
+            "",
+        )
+    )
+
+    raw = (
+        "episode|"
+        + series_id
+        + "|"
+        + str(season)
+        + "|"
+        + str(episode_number)
+        + "|"
+        + title
+    )
+
+    return hashlib.sha256(
+        raw.encode("utf-8")
+    ).hexdigest()[:20]
+
+
+def normalize_identity_text(value):
+    text = str(value or "").strip().casefold()
+
+    replacements = (
+        "┃nl┃",
+        "┃be┃",
+        "┃de┃",
+        "┃fr┃",
+        "┃uk┃",
+        "┃us┃",
+        "┃es┃",
+        "┃it┃",
+        "┃pt┃",
+        "┃tr┃",
+    )
+
+    for marker in replacements:
+        text = text.replace(
+            marker,
+            "",
+        )
+
+    return " ".join(
+        text.split()
+    )
+
+
+def episode_label(episode):
+    season = safe_int(
+        episode.get(
+            "season",
+            0,
+        ),
+        0,
+    )
+
+    number = safe_int(
+        episode.get(
+            "episode_num",
+            0,
+        ),
+        0,
+    )
+
+    title = str(
+        episode.get(
+            "title",
+            "",
+        )
+        or ""
+    ).strip()
+
+    if season or number:
+        prefix = (
+            f"S{season:02d}"
+            f"E{number:02d}"
+        )
+
+        if title:
+            return (
+                f"{prefix} - {title}"
+            )
+
+        return prefix
+
+    return title or "Episode"
+
+
+def flatten_series_episodes(
+    series_item,
+):
+    episodes = series_item.get(
+        "episodes",
+        {},
+    )
+
+    if not isinstance(
+        episodes,
+        dict,
+    ):
+        return []
+
+    result = []
+
+    for season_key, season_episodes in episodes.items():
+        if not isinstance(
+            season_episodes,
+            list,
+        ):
+            continue
+
+        for episode in season_episodes:
+            if not isinstance(
+                episode,
+                dict,
+            ):
+                continue
+
+            episode_copy = dict(
+                episode
+            )
+
+            if not episode_copy.get(
+                "season"
+            ):
+                episode_copy[
+                    "season"
+                ] = safe_int(
+                    season_key,
+                    0,
+                )
+
+            result.append(
+                episode_copy
+            )
+
+    return result
+
+
+def update_series_state_from_cache():
+    """
+    Vergelijkt de huidige Series-cache met de permanente state.
+
+    Nieuwe episodes worden als new=true opgeslagen.
+    Bestaande watched-status blijft behouden.
+    """
+
+    state = load_series_state()
+
+    series_items = load_cache_items(
+        "series"
+    )
+
+    current_series_keys = set()
+
+    for series_item in series_items:
+        if not isinstance(
+            series_item,
+            dict,
+        ):
+            continue
+
+        series_key = series_state_key(
+            series_item
+        )
+
+        current_series_keys.add(
+            series_key
+        )
+
+        series_name = catalog_name(
+            series_item
+        )
+
+        existing = state[
+            "series"
+        ].get(
+            series_key,
+            {},
+        )
+
+        if not isinstance(
+            existing,
+            dict,
+        ):
+            existing = {}
+
+        existing["name"] = series_name
+
+        existing["category"] = (
+            catalog_category_name(
+                series_item
+            )
+        )
+
+        existing.setdefault(
+            "watching",
+            False,
+        )
+
+        existing.setdefault(
+            "watched_episodes",
+            [],
+        )
+
+        existing.setdefault(
+            "episodes",
+            {},
+        )
+
+        existing.setdefault(
+            "new_episodes",
+            [],
+        )
+
+        known_episodes = existing[
+            "episodes"
+        ]
+
+        if not isinstance(
+            known_episodes,
+            dict,
+        ):
+            known_episodes = {}
+
+        new_episode_ids = set(
+            existing.get(
+                "new_episodes",
+                [],
+            )
+        )
+
+        for episode in flatten_series_episodes(
+            series_item
+        ):
+            episode_key = episode_state_key(
+                series_item,
+                episode,
+            )
+
+            label = episode_label(
+                episode
+            )
+
+            was_known = (
+                episode_key
+                in known_episodes
+            )
+
+            known_episodes[
+                episode_key
+            ] = {
+                "label": label,
+                "season": safe_int(
+                    episode.get(
+                        "season",
+                        0,
+                    ),
+                    0,
+                ),
+                "episode": safe_int(
+                    episode.get(
+                        "episode_num",
+                        0,
+                    ),
+                    0,
+                ),
+                "title": str(
+                    episode.get(
+                        "title",
+                        "",
+                    )
+                    or ""
+                ),
+                "first_seen": known_episodes.get(
+                    episode_key,
+                    {},
+                ).get(
+                    "first_seen",
+                    now_unix(),
+                ),
+                "last_seen": now_unix(),
+                "watched": (
+                    episode_key
+                    in set(
+                        existing.get(
+                            "watched_episodes",
+                            [],
+                        )
+                    )
+                ),
+            }
+
+            if (
+                not was_known
+                and episode_key
+                not in set(
+                    existing.get(
+                        "watched_episodes",
+                        [],
+                    )
+                )
+            ):
+                new_episode_ids.add(
+                    episode_key
+                )
+
+        existing["episodes"] = (
+            known_episodes
+        )
+
+        existing["new_episodes"] = sorted(
+            new_episode_ids
+        )
+
+        state[
+            "series"
+        ][series_key] = existing
+
+    save_series_state(
+        state
+    )
+
+    return state
+
+
+def watchlist_series():
+    state = load_series_state()
+
+    result = []
+
+    for series_key in state[
+        "watchlist"
+    ]:
+        item = state[
+            "series"
+        ].get(
+            series_key
+        )
+
+        if item:
+            result.append(
+                {
+                    "series_id": series_key,
+                    **item,
+                }
+            )
+
+    return result
+
+
+def new_episode_list():
+    state = load_series_state()
+
+    result = []
+
+    for series_key, series in state[
+        "series"
+    ].items():
+
+        if not series.get(
+            "watching",
+            False,
+        ):
+            continue
+
+        for episode_key in series.get(
+            "new_episodes",
+            [],
+        ):
+            episode = series.get(
+                "episodes",
+                {},
+            ).get(
+                episode_key
+            )
+
+            if not episode:
+                continue
+
+            result.append(
+                {
+                    "series_id": series_key,
+                    "episode_id": episode_key,
+                    "series_name": series.get(
+                        "name",
+                        "",
+                    ),
+                    **episode,
+                }
+            )
+
+    result.sort(
+        key=lambda item: (
+            item.get(
+                "first_seen",
+                0,
+            ),
+            item.get(
+                "series_name",
+                "",
+            ).casefold(),
+        ),
+        reverse=True,
+    )
+
+    return result
+
+
+def set_series_watching(
+    series_id,
+    enabled,
+):
+    state = load_series_state()
+
+    series = state[
+        "series"
+    ].get(
+        series_id
+    )
+
+    if series is None:
+        return False
+
+    series["watching"] = bool(
+        enabled
+    )
+
+    watchlist = set(
+        state.get(
+            "watchlist",
+            [],
+        )
+    )
+
+    if enabled:
+        watchlist.add(
+            series_id
+        )
+    else:
+        watchlist.discard(
+            series_id
+        )
+
+    state[
+        "watchlist"
+    ] = sorted(
+        watchlist
+    )
+
+    save_series_state(
+        state
+    )
+
+    return True
+
+
+def mark_episode_watched(
+    series_id,
+    episode_id,
+    watched=True,
+):
+    state = load_series_state()
+
+    series = state[
+        "series"
+    ].get(
+        series_id
+    )
+
+    if not series:
+        return False
+
+    watched_ids = set(
+        series.get(
+            "watched_episodes",
+            [],
+        )
+    )
+
+    new_ids = set(
+        series.get(
+            "new_episodes",
+            [],
+        )
+    )
+
+    if watched:
+        watched_ids.add(
+            episode_id
+        )
+        new_ids.discard(
+            episode_id
+        )
+    else:
+        watched_ids.discard(
+            episode_id
+        )
+
+    series[
+        "watched_episodes"
+    ] = sorted(
+        watched_ids
+    )
+
+    series[
+        "new_episodes"
+    ] = sorted(
+        new_ids
+    )
+
+    episode = series.get(
+        "episodes",
+        {},
+    ).get(
+        episode_id
+    )
+
+    if episode:
+        episode["watched"] = bool(
+            watched
+        )
+
+    save_series_state(
+        state
+    )
+
+    return True
+
+
+# ============================================================================
+# CACHE
+# ============================================================================
+
+def load_cache_items(cache_type):
     payload = read_json_file(
         CACHE_FILES[cache_type]
     )
@@ -577,9 +1155,7 @@ def load_cache_items(
     return items
 
 
-def cache_age_seconds(
-    payload,
-):
+def cache_age_seconds(payload):
     if not isinstance(
         payload,
         dict,
@@ -592,10 +1168,7 @@ def cache_age_seconds(
 
     if not isinstance(
         created_at,
-        (
-            int,
-            float,
-        ),
+        (int, float),
     ):
         return None
 
@@ -605,9 +1178,7 @@ def cache_age_seconds(
     )
 
 
-def cache_is_fresh(
-    cache_type,
-):
+def cache_is_fresh(cache_type):
     payload = read_json_file(
         CACHE_FILES[cache_type]
     )
@@ -633,9 +1204,7 @@ def cache_is_fresh(
     )
 
 
-def cache_status(
-    cache_type,
-):
+def cache_status(cache_type):
     payload = read_json_file(
         CACHE_FILES[cache_type]
     )
@@ -700,7 +1269,7 @@ def write_cache(
     provider_priority,
 ):
     payload = {
-        "version": 1,
+        "version": 2,
         "type": cache_type,
         "created_at": now_unix(),
         "provider_priority": (
@@ -770,7 +1339,7 @@ def http_get_json(
 
 
 # ============================================================================
-# XTREAM PROVIDER
+# XTREAM
 # ============================================================================
 
 def xtream_url(
@@ -830,9 +1399,7 @@ def fetch_xtream_action(
     )
 
 
-def as_list(
-    value,
-):
+def as_list(value):
     if isinstance(
         value,
         list,
@@ -842,9 +1409,7 @@ def as_list(
     return []
 
 
-def category_map(
-    categories,
-):
+def category_map(categories):
     result = {}
 
     for category in as_list(
@@ -867,7 +1432,9 @@ def category_map(
         if not category_id:
             continue
 
-        result[category_id] = str(
+        result[
+            category_id
+        ] = str(
             category.get(
                 "category_name",
                 "",
@@ -882,9 +1449,7 @@ def category_map(
 # PROVIDER HEALTH
 # ============================================================================
 
-def check_xtream_server(
-    server,
-):
+def check_xtream_server(server):
     username = str(
         CONFIG.get(
             "server_username",
@@ -930,12 +1495,8 @@ def check_xtream_server(
         if not 200 <= status_code < 300:
             return {
                 "online": False,
-                "reason": (
-                    f"http_{status_code}"
-                ),
-                "response_time_ms": (
-                    elapsed_ms
-                ),
+                "reason": f"http_{status_code}",
+                "response_time_ms": elapsed_ms,
             }
 
         try:
@@ -950,9 +1511,7 @@ def check_xtream_server(
             return {
                 "online": False,
                 "reason": "invalid_json",
-                "response_time_ms": (
-                    elapsed_ms
-                ),
+                "response_time_ms": elapsed_ms,
             }
 
         user_info = data.get(
@@ -968,9 +1527,7 @@ def check_xtream_server(
                 "reason": (
                     "invalid_xtream_response"
                 ),
-                "response_time_ms": (
-                    elapsed_ms
-                ),
+                "response_time_ms": elapsed_ms,
             }
 
         auth = user_info.get(
@@ -983,9 +1540,7 @@ def check_xtream_server(
                 "reason": (
                     "authentication_failed"
                 ),
-                "response_time_ms": (
-                    elapsed_ms
-                ),
+                "response_time_ms": elapsed_ms,
             }
 
         account_status = str(
@@ -1010,17 +1565,13 @@ def check_xtream_server(
                 "reason": (
                     f"account_{account_status}"
                 ),
-                "response_time_ms": (
-                    elapsed_ms
-                ),
+                "response_time_ms": elapsed_ms,
             }
 
         return {
             "online": True,
             "reason": "ok",
-            "response_time_ms": (
-                elapsed_ms
-            ),
+            "response_time_ms": elapsed_ms,
         }
 
     except HTTPError as exc:
@@ -1035,12 +1586,8 @@ def check_xtream_server(
 
         return {
             "online": False,
-            "reason": (
-                f"http_{exc.code}"
-            ),
-            "response_time_ms": (
-                elapsed_ms
-            ),
+            "reason": f"http_{exc.code}",
+            "response_time_ms": elapsed_ms,
         }
 
     except (
@@ -1068,9 +1615,7 @@ def check_xtream_server(
                 reason
                 or "connection_error"
             ),
-            "response_time_ms": (
-                elapsed_ms
-            ),
+            "response_time_ms": elapsed_ms,
         }
 
     except Exception as exc:
@@ -1088,9 +1633,7 @@ def check_xtream_server(
             "reason": type(
                 exc
             ).__name__,
-            "response_time_ms": (
-                elapsed_ms
-            ),
+            "response_time_ms": elapsed_ms,
         }
 
 
@@ -1103,12 +1646,7 @@ def update_server_state(
             "servers"
         ].setdefault(
             server,
-            {
-                "online": False,
-                "reason": "not_checked",
-                "response_time_ms": None,
-                "last_check": None,
-            },
+            {},
         )
 
         state.update(
@@ -1181,9 +1719,7 @@ def select_active_server():
     )
 
 
-def check_provider(
-    server,
-):
+def check_provider(server):
     result = check_xtream_server(
         server
     )
@@ -1227,23 +1763,21 @@ def check_servers(
         )
 
         if result["online"]:
-            if priority is not None:
-                LOGGER.info(
-                    "P%d online (%sms)",
-                    priority,
-                    result[
-                        "response_time_ms"
-                    ],
-                )
+            LOGGER.info(
+                "P%d online (%sms)",
+                priority,
+                result[
+                    "response_time_ms"
+                ],
+            )
         else:
-            if priority is not None:
-                LOGGER.warning(
-                    "P%d offline: %s",
-                    priority,
-                    result[
-                        "reason"
-                    ],
-                )
+            LOGGER.warning(
+                "P%d offline: %s",
+                priority,
+                result[
+                    "reason"
+                ],
+            )
 
     select_active_server()
 
@@ -1463,9 +1997,7 @@ def normalize_item(
     return normalized
 
 
-def deduplicate_items(
-    items,
-):
+def deduplicate_items(items):
     result = []
     seen = set()
 
@@ -1476,19 +2008,7 @@ def deduplicate_items(
         ):
             continue
 
-        stream_id = (
-            item.get(
-                "stream_id"
-            )
-            or item.get(
-                "series_id"
-            )
-            or item.get(
-                "id"
-            )
-        )
-
-        name = str(
+        name = normalize_identity_text(
             item.get(
                 "name",
                 "",
@@ -1497,16 +2017,32 @@ def deduplicate_items(
                 "title",
                 "",
             )
-            or ""
-        ).strip()
+        )
+
+        category = normalize_identity_text(
+            item.get(
+                "_streamhub",
+                {},
+            ).get(
+                "category_name",
+                "",
+            )
+        )
+
+        source_type = str(
+            item.get(
+                "_streamhub",
+                {},
+            ).get(
+                "type",
+                "",
+            )
+        )
 
         key = (
-            str(stream_id)
-            if stream_id is not None
-            else (
-                "name:"
-                + name.casefold()
-            )
+            source_type,
+            category,
+            name,
         )
 
         if key in seen:
@@ -1904,6 +2440,8 @@ def build_series_cache():
         priority,
     )
 
+    update_series_state_from_cache()
+
     LOGGER.info(
         "Series cache written: %d item(s)",
         len(results),
@@ -1916,9 +2454,7 @@ def build_series_cache():
 # CACHE REFRESH
 # ============================================================================
 
-def refresh_cache_type(
-    cache_type,
-):
+def refresh_cache_type(cache_type):
     if cache_type == "tv":
         return build_tv_cache()
 
@@ -1996,16 +2532,6 @@ def refresh_all_caches():
                     errors
                 )
 
-        if errors:
-            LOGGER.warning(
-                "Cache refresh completed with errors: %s",
-                ", ".join(errors),
-            )
-        else:
-            LOGGER.info(
-                "Complete cache refresh finished successfully"
-            )
-
         return not errors
 
     finally:
@@ -2021,10 +2547,6 @@ def prewarm_thread():
     time.sleep(2)
 
     try:
-        LOGGER.info(
-            "Starting one-time background cache prewarm"
-        )
-
         refresh_all_caches()
 
     except Exception as exc:
@@ -2035,70 +2557,56 @@ def prewarm_thread():
 
 
 # ============================================================================
-# STREAMHUB IDENTIFIERS
+# CATALOG IDENTIFIERS
 # ============================================================================
 
 def streamhub_id(
     cache_type,
     item,
 ):
-    source_id = (
-        item.get(
-            "stream_id"
-        )
-        or item.get(
-            "series_id"
-        )
-        or item.get(
-            "episode_id"
-        )
-        or item.get(
-            "id"
-        )
+    """
+    Provider-onafhankelijke catalogus-ID.
+
+    Voor TV/movie/series gebruiken we inhoudelijke kenmerken
+    in plaats van de provider stream_id.
+    """
+
+    name = normalize_identity_text(
+        catalog_name(item)
     )
 
-    name = str(
+    category = normalize_identity_text(
+        catalog_category_name(item)
+    )
+
+    year = str(
         item.get(
-            "name",
+            "year",
             "",
         )
         or item.get(
-            "title",
+            "releaseDate",
             "",
         )
         or ""
-    )
-
-    category = str(
-        item.get(
-            "category_id",
-            "",
-        )
-        or item.get(
-            "_streamhub",
-            {},
-        ).get(
-            "category_name",
-            "",
-        )
-        or ""
-    )
+    ).strip()
 
     raw = (
-        f"{cache_type}|"
-        f"{source_id}|"
-        f"{category}|"
-        f"{name}"
+        cache_type
+        + "|"
+        + category
+        + "|"
+        + name
+        + "|"
+        + year
     )
 
     return hashlib.sha256(
         raw.encode("utf-8")
-    ).hexdigest()[:16]
+    ).hexdigest()[:20]
 
 
-def catalog_name(
-    item,
-):
+def catalog_name(item):
     return str(
         item.get(
             "name",
@@ -2109,12 +2617,10 @@ def catalog_name(
             "",
         )
         or "StreamHub item"
-    )
+    ).strip()
 
 
-def catalog_category_name(
-    item,
-):
+def catalog_category_name(item):
     return str(
         item.get(
             "_streamhub",
@@ -2128,34 +2634,17 @@ def catalog_category_name(
             "",
         )
         or "StreamHub"
-    )
+    ).strip()
 
 
-def catalog_category_id(
-    item,
-):
-    value = str(
-        item.get(
-            "category_id",
-            "",
-        )
-        or ""
-    )
-
-    if value:
-        return value
-
-    category = (
-        catalog_category_name(
-            item
-        )
+def catalog_category_id(item):
+    category = normalize_identity_text(
+        catalog_category_name(item)
     )
 
     digest = hashlib.sha256(
-        category.encode(
-            "utf-8"
-        )
-    ).hexdigest()[:8]
+        category.encode("utf-8")
+    ).hexdigest()[:12]
 
     return str(
         int(
@@ -2177,29 +2666,12 @@ def stream_extension(
         or default
     ).strip().lstrip(".")
 
-    return (
-        extension
-        or default
-    )
+    return extension or default
 
 
 # ============================================================================
-# M3U
+# URL BUILDING
 # ============================================================================
-
-def m3u_escape(
-    value,
-):
-    return str(
-        value or ""
-    ).replace(
-        "\n",
-        " ",
-    ).replace(
-        "\r",
-        " ",
-    )
-
 
 def streamhub_url_for_item(
     request,
@@ -2209,18 +2681,6 @@ def streamhub_url_for_item(
     base = get_public_base_url(
         request
     )
-
-    if not base:
-        host = request.headers.get(
-            "Host",
-            "",
-        ).strip()
-
-        if host:
-            base = (
-                "http://"
-                + host
-            )
 
     item_id = streamhub_id(
         cache_type,
@@ -2235,7 +2695,8 @@ def streamhub_url_for_item(
         suffix = (
             "?key="
             + quote(
-                key
+                key,
+                safe="",
             )
         )
 
@@ -2247,11 +2708,9 @@ def streamhub_url_for_item(
         )
 
     if cache_type == "movies":
-        extension = (
-            stream_extension(
-                item,
-                "mp4",
-            )
+        extension = stream_extension(
+            item,
+            "mp4",
         )
 
         return (
@@ -2261,11 +2720,9 @@ def streamhub_url_for_item(
             f"{suffix}"
         )
 
-    extension = (
-        stream_extension(
-            item,
-            "mp4",
-        )
+    extension = stream_extension(
+        item,
+        "mp4",
     )
 
     return (
@@ -2273,6 +2730,62 @@ def streamhub_url_for_item(
         f"{item_id}."
         f"{extension}"
         f"{suffix}"
+    )
+
+
+def streamhub_episode_url(
+    request,
+    series_item,
+    episode,
+):
+    base = get_public_base_url(
+        request
+    )
+
+    episode_id = episode_state_key(
+        series_item,
+        episode,
+    )
+
+    extension = stream_extension(
+        episode,
+        "mp4",
+    )
+
+    key = get_access_key()
+
+    suffix = ""
+
+    if key:
+        suffix = (
+            "?key="
+            + quote(
+                key,
+                safe="",
+            )
+        )
+
+    return (
+        f"{base}/series/"
+        f"{episode_id}."
+        f"{extension}"
+        f"{suffix}"
+    )
+
+
+# ============================================================================
+# M3U
+# ============================================================================
+
+def m3u_escape(value):
+    return str(
+        value or ""
+    ).replace(
+        "\n",
+        " ",
+    ).replace(
+        "\r",
+        " ",
     )
 
 
@@ -2291,68 +2804,106 @@ def build_m3u(
         ),
     ]
 
-    for item in items:
-        name = m3u_escape(
-            catalog_name(item)
-        )
-
-        category = m3u_escape(
-            catalog_category_name(
-                item
-            )
-        )
-
-        logo = str(
-            item.get(
-                "stream_icon",
-                "",
-            )
-            or item.get(
-                "cover",
-                "",
-            )
-            or ""
-        ).strip()
-
-        tvg_id = str(
-            item.get(
-                "epg_channel_id",
-                "",
-            )
-            or item.get(
-                "epg_id",
-                "",
-            )
-            or ""
-        ).strip()
-
-        attributes = [
-            f'tvg-id="{m3u_escape(tvg_id)}"',
-            f'tvg-name="{name}"',
-            f'group-title="{category}"',
-        ]
-
-        if logo:
-            attributes.append(
-                f'tvg-logo="{m3u_escape(logo)}"'
+    if cache_type != "series":
+        for item in items:
+            name = m3u_escape(
+                catalog_name(item)
             )
 
-        lines.append(
-            "#EXTINF:-1 "
-            + " ".join(
-                attributes
+            category = m3u_escape(
+                catalog_category_name(
+                    item
+                )
             )
-            + ","
-            + name
-        )
 
-        lines.append(
-            streamhub_url_for_item(
-                request,
-                cache_type,
-                item,
+            logo = str(
+                item.get(
+                    "stream_icon",
+                    "",
+                )
+                or item.get(
+                    "cover",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            tvg_id = str(
+                item.get(
+                    "epg_channel_id",
+                    "",
+                )
+                or item.get(
+                    "epg_id",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            attributes = [
+                f'tvg-id="{m3u_escape(tvg_id)}"',
+                f'tvg-name="{name}"',
+                f'group-title="{category}"',
+            ]
+
+            if logo:
+                attributes.append(
+                    f'tvg-logo="{m3u_escape(logo)}"'
+                )
+
+            lines.append(
+                "#EXTINF:-1 "
+                + " ".join(
+                    attributes
+                )
+                + ","
+                + name
             )
-        )
+
+            lines.append(
+                streamhub_url_for_item(
+                    request,
+                    cache_type,
+                    item,
+                )
+            )
+
+    else:
+        for series in items:
+            series_name = catalog_name(
+                series
+            )
+
+            category = catalog_category_name(
+                series
+            )
+
+            for episode in flatten_series_episodes(
+                series
+            ):
+                label = episode_label(
+                    episode
+                )
+
+                display_name = (
+                    f"{series_name} - "
+                    f"{label}"
+                )
+
+                lines.append(
+                    "#EXTINF:-1 "
+                    f'tvg-name="{m3u_escape(display_name)}" '
+                    f'group-title="{m3u_escape(category)}",'
+                    f"{m3u_escape(display_name)}"
+                )
+
+                lines.append(
+                    streamhub_episode_url(
+                        request,
+                        series,
+                        episode,
+                    )
+                )
 
     return (
         "\n".join(lines)
@@ -2397,12 +2948,8 @@ def api_category_list(
         categories[
             category_id
         ] = {
-            "category_id": (
-                category_id
-            ),
-            "category_name": (
-                category_name
-            ),
+            "category_id": category_id,
+            "category_name": category_name,
             "parent_id": 0,
         }
 
@@ -2430,18 +2977,12 @@ def api_stream_list(
 
         if (
             category_id is not None
-            and str(
-                category_id
-            )
-            != str(
-                item_category_id
-            )
+            and str(category_id)
+            != str(item_category_id)
         ):
             continue
 
-        result.append(
-            item
-        )
+        result.append(item)
 
     return result
 
@@ -2452,9 +2993,7 @@ def xtream_live_item(
 ):
     return {
         "num": 0,
-        "name": catalog_name(
-            item
-        ),
+        "name": catalog_name(item),
         "stream_type": "live",
         "stream_id": streamhub_id(
             "tv",
@@ -2507,9 +3046,7 @@ def xtream_vod_item(
 ):
     return {
         "num": 0,
-        "name": catalog_name(
-            item
-        ),
+        "name": catalog_name(item),
         "stream_type": "movie",
         "stream_id": streamhub_id(
             "movies",
@@ -2557,25 +3094,28 @@ def xtream_vod_item(
     }
 
 
-def xtream_series_item(
-    item,
-):
+def xtream_series_item(item):
+    series_id = series_state_key(
+        item
+    )
+
     return {
         "num": 0,
-        "name": catalog_name(
-            item
-        ),
-        "series_id": streamhub_id(
-            "series",
-            item,
-        ),
+        "name": catalog_name(item),
+        "series_id": series_id,
         "cover": item.get(
             "cover",
             "",
         ),
         "plot": item.get(
             "plot",
-            "",
+            item.get(
+                "info",
+                {},
+            ).get(
+                "plot",
+                "",
+            ),
         ),
         "cast": item.get(
             "cast",
@@ -2628,63 +3168,147 @@ def find_cached_item(
     for item in load_cache_items(
         cache_type
     ):
-        if (
-            streamhub_id(
+        if cache_type == "series":
+            current_id = series_state_key(
+                item
+            )
+        else:
+            current_id = streamhub_id(
                 cache_type,
                 item,
             )
-            == str(item_id)
+
+        if current_id == str(
+            item_id
         ):
             return item
 
     return None
 
 
-def xtream_profile(
+def transform_series_info(
     request,
+    series_item,
 ):
-    return {
-        "user_info": {
-            "username": "streamhub",
-            "password": (
-                "configured"
-                if get_access_key()
-                else ""
+    episodes_by_season = {}
+
+    for episode in flatten_series_episodes(
+        series_item
+    ):
+        season = safe_int(
+            episode.get(
+                "season",
+                0,
             ),
-            "message": "",
-            "auth": 1,
-            "status": "Active",
-            "exp_date": None,
-            "is_trial": "0",
-            "active_cons": "0",
-            "created_at": str(
-                now_unix()
+            0,
+        )
+
+        episode_id = episode_state_key(
+            series_item,
+            episode,
+        )
+
+        output = dict(
+            episode
+        )
+
+        output[
+            "id"
+        ] = episode_id
+
+        output[
+            "episode_num"
+        ] = safe_int(
+            episode.get(
+                "episode_num",
+                0,
             ),
-            "max_connections": "1",
-            "allowed_output_formats": [
-                "m3u8",
-                "ts",
-                "rtmp",
-            ],
-        },
-        "server_info": {
-            "url": get_public_base_url(
-                request
-            ),
-            "port": str(PORT),
-            "https_port": str(PORT),
-            "server_protocol": "http",
-            "rtmp_port": "0",
-            "timezone": (
-                "Europe/Amsterdam"
-            ),
-            "timestamp_now": now_unix(),
-            "time_now": time.strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
-            "process": APP_NAME,
-        },
-    }
+            0,
+        )
+
+        output[
+            "season"
+        ] = season
+
+        output[
+            "title"
+        ] = str(
+            episode.get(
+                "title",
+                "",
+            )
+            or ""
+        )
+
+        output[
+            "container_extension"
+        ] = stream_extension(
+            episode,
+            "mp4",
+        )
+
+        output[
+            "direct_source"
+        ] = streamhub_episode_url(
+            request,
+            series_item,
+            episode,
+        )
+
+        output[
+            "_streamhub_new"
+        ] = (
+            episode_id
+            in set(
+                load_series_state()
+                .get(
+                    "series",
+                    {}
+                )
+                .get(
+                    series_state_key(
+                        series_item
+                    ),
+                    {},
+                )
+                .get(
+                    "new_episodes",
+                    [],
+                )
+            )
+        )
+
+        output[
+            "_streamhub_watched"
+        ] = (
+            episode_id
+            in set(
+                load_series_state()
+                .get(
+                    "series",
+                    {}
+                )
+                .get(
+                    series_state_key(
+                        series_item
+                    ),
+                    {},
+                )
+                .get(
+                    "watched_episodes",
+                    [],
+                )
+            )
+        )
+
+        episodes_by_season.setdefault(
+            str(season),
+            [],
+        ).append(
+            output
+        )
+
+    return episodes_by_season
 
 
 def player_api_response(
@@ -2701,23 +3325,17 @@ def player_api_response(
             request
         )
 
-    if action == (
-        "get_live_categories"
-    ):
+    if action == "get_live_categories":
         return api_category_list(
             "tv"
         )
 
-    if action == (
-        "get_vod_categories"
-    ):
+    if action == "get_vod_categories":
         return api_category_list(
             "movies"
         )
 
-    if action == (
-        "get_series_categories"
-    ):
+    if action == "get_series_categories":
         return api_category_list(
             "series"
         )
@@ -2727,9 +3345,7 @@ def player_api_response(
         [None],
     )[0]
 
-    if action == (
-        "get_live_streams"
-    ):
+    if action == "get_live_streams":
         return [
             xtream_live_item(
                 request,
@@ -2741,9 +3357,7 @@ def player_api_response(
             )
         ]
 
-    if action == (
-        "get_vod_streams"
-    ):
+    if action == "get_vod_streams":
         return [
             xtream_vod_item(
                 request,
@@ -2766,9 +3380,7 @@ def player_api_response(
             )
         ]
 
-    if action == (
-        "get_series_info"
-    ):
+    if action == "get_series_info":
         series_id = query.get(
             "series_id",
             [None],
@@ -2786,20 +3398,94 @@ def player_api_response(
                 "seasons": [],
             }
 
+        state = load_series_state()
+
+        series_state = state[
+            "series"
+        ].get(
+            series_state_key(
+                item
+            ),
+            {},
+        )
+
         return {
             "info": item.get(
                 "info",
                 {},
             ),
-            "episodes": item.get(
-                "episodes",
-                {},
+            "episodes": transform_series_info(
+                request,
+                item,
             ),
             "seasons": item.get(
                 "seasons",
                 [],
             ),
+            "_streamhub": {
+                "watching": series_state.get(
+                    "watching",
+                    False,
+                ),
+                "new_episode_count": len(
+                    series_state.get(
+                        "new_episodes",
+                        [],
+                    )
+                ),
+            },
         }
+
+    if action == "get_vod_info":
+        vod_id = query.get(
+            "vod_id",
+            [None],
+        )[0]
+
+        item = find_cached_item(
+            "movies",
+            vod_id,
+        )
+
+        if item is None:
+            return {}
+
+        return {
+            "info": item.get(
+                "info",
+                {},
+            ),
+            "movie_data": {
+                "stream_id": streamhub_id(
+                    "movies",
+                    item,
+                ),
+                "name": catalog_name(
+                    item
+                ),
+                "container_extension": (
+                    stream_extension(
+                        item,
+                        "mp4",
+                    )
+                ),
+                "direct_source": (
+                    streamhub_url_for_item(
+                        request,
+                        "movies",
+                        item,
+                    )
+                ),
+            },
+        }
+
+    if action == "get_short_epg":
+        return {
+            "epg_listings": []
+        }
+
+    if action == "get_simple_data_table":
+        return []
 
     return {
         "error": "unsupported_action",
@@ -2807,8 +3493,49 @@ def player_api_response(
     }
 
 
+def xtream_profile(request):
+    return {
+        "user_info": {
+            "username": "streamhub",
+            "password": (
+                "configured"
+                if get_access_key()
+                else ""
+            ),
+            "message": "",
+            "auth": 1,
+            "status": "Active",
+            "exp_date": None,
+            "is_trial": "0",
+            "active_cons": "0",
+            "created_at": str(
+                now_unix()
+            ),
+            "max_connections": "1",
+            "allowed_output_formats": [
+                "m3u8",
+                "ts",
+            ],
+        },
+        "server_info": {
+            "url": get_public_base_url(
+                request
+            ),
+            "port": str(PORT),
+            "https_port": str(PORT),
+            "server_protocol": "http",
+            "timezone": "Europe/Amsterdam",
+            "timestamp_now": now_unix(),
+            "time_now": time.strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+            "process": APP_NAME,
+        },
+    }
+
+
 # ============================================================================
-# HTTP RESPONSE HELPERS
+# HTTP RESPONSE
 # ============================================================================
 
 def send_json(
@@ -2820,9 +3547,7 @@ def send_json(
         payload,
         ensure_ascii=False,
         indent=2,
-    ).encode(
-        "utf-8"
-    )
+    ).encode("utf-8")
 
     handler.send_response(
         status_code
@@ -2939,12 +3664,13 @@ class StreamHubHandler(
         )
 
         path = parsed.path
+
         query = parse_qs(
             parsed.query
         )
 
         # ------------------------------------------------------------
-        # Home Assistant watchdog
+        # HEALTH
         # ------------------------------------------------------------
 
         if path == "/health":
@@ -2960,7 +3686,7 @@ class StreamHubHandler(
             return
 
         # ------------------------------------------------------------
-        # Authentication
+        # AUTH
         # ------------------------------------------------------------
 
         if not is_authorized(
@@ -2977,7 +3703,7 @@ class StreamHubHandler(
             return
 
         # ------------------------------------------------------------
-        # Root
+        # ROOT
         # ------------------------------------------------------------
 
         if path == "/":
@@ -2988,33 +3714,19 @@ class StreamHubHandler(
                     "application": APP_NAME,
                     "version": APP_VERSION,
                     "status": "running",
-                    "public_host": (
-                        get_public_base_url(
-                            self
-                        )
-                    ),
                     "content_filter": (
                         content_filter_description()
-                    ),
-                    "active_provider": (
-                        "configured"
-                        if STATE[
-                            "active_server"
-                        ]
-                        else None
                     ),
                 },
             )
             return
 
         # ------------------------------------------------------------
-        # Status
+        # STATUS
         # ------------------------------------------------------------
 
         if path == "/status":
-            servers = (
-                configured_servers()
-            )
+            servers = configured_servers()
 
             with STATE_LOCK:
                 provider_status = []
@@ -3027,24 +3739,16 @@ class StreamHubHandler(
                         "servers"
                     ].get(
                         server,
-                        {
-                            "online": False,
-                            "reason": (
-                                "not_checked"
-                            ),
-                            "response_time_ms": None,
-                            "last_check": None,
-                        },
+                        {},
                     )
 
                     provider_status.append(
                         {
-                            "priority": (
-                                priority
+                            "priority": priority,
+                            "online": state.get(
+                                "online",
+                                False,
                             ),
-                            "online": state[
-                                "online"
-                            ],
                             "active": (
                                 server
                                 == STATE[
@@ -3052,16 +3756,17 @@ class StreamHubHandler(
                                 ]
                             ),
                             "response_time_ms": (
-                                state[
+                                state.get(
                                     "response_time_ms"
-                                ]
+                                )
                             ),
-                            "reason": state[
-                                "reason"
-                            ],
-                            "last_check": state[
+                            "reason": state.get(
+                                "reason",
+                                "not_checked",
+                            ),
+                            "last_check": state.get(
                                 "last_check"
-                            ],
+                            ),
                         }
                     )
 
@@ -3085,20 +3790,13 @@ class StreamHubHandler(
                 payload = {
                     "application": APP_NAME,
                     "version": APP_VERSION,
-                    "public_host": (
-                        get_public_base_url(
-                            self
-                        )
-                    ),
                     "content_filter": (
                         content_filter_description()
                     ),
                     "active_provider_priority": (
                         active_priority
                     ),
-                    "providers": (
-                        provider_status
-                    ),
+                    "providers": provider_status,
                     "last_health_check": (
                         STATE[
                             "last_health_check"
@@ -3113,6 +3811,17 @@ class StreamHubHandler(
                         ),
                         "series": cache_status(
                             "series"
+                        ),
+                    },
+                    "series_state": {
+                        "watchlist_count": len(
+                            load_series_state().get(
+                                "watchlist",
+                                [],
+                            )
+                        ),
+                        "new_episode_count": len(
+                            new_episode_list()
                         ),
                     },
                     "refresh": {
@@ -3139,15 +3848,12 @@ class StreamHubHandler(
             return
 
         # ------------------------------------------------------------
-        # Manual provider check
+        # PROVIDER CHECK
         # ------------------------------------------------------------
 
         if path == "/check-servers":
             thread = threading.Thread(
                 target=check_all_servers,
-                name=(
-                    "streamhub-manual-health-check"
-                ),
                 daemon=True,
             )
 
@@ -3166,7 +3872,7 @@ class StreamHubHandler(
             return
 
         # ------------------------------------------------------------
-        # Manual cache refresh
+        # CACHE REFRESH
         # ------------------------------------------------------------
 
         if path == "/refresh":
@@ -3190,9 +3896,6 @@ class StreamHubHandler(
 
             thread = threading.Thread(
                 target=refresh_all_caches,
-                name=(
-                    "streamhub-manual-cache-refresh"
-                ),
                 daemon=True,
             )
 
@@ -3211,7 +3914,7 @@ class StreamHubHandler(
             return
 
         # ------------------------------------------------------------
-        # Cache status
+        # CACHE
         # ------------------------------------------------------------
 
         if path == "/cache":
@@ -3233,7 +3936,178 @@ class StreamHubHandler(
             return
 
         # ------------------------------------------------------------
-        # Xtream API
+        # SERIES STATE
+        # ------------------------------------------------------------
+
+        if path == "/series-state":
+            send_json(
+                self,
+                200,
+                load_series_state(),
+            )
+            return
+
+        if path == "/watchlist":
+            send_json(
+                self,
+                200,
+                {
+                    "series": watchlist_series(),
+                    "count": len(
+                        watchlist_series()
+                    ),
+                },
+            )
+            return
+
+        if path == "/new-episodes":
+            send_json(
+                self,
+                200,
+                {
+                    "episodes": (
+                        new_episode_list()
+                    ),
+                    "count": len(
+                        new_episode_list()
+                    ),
+                },
+            )
+            return
+
+        # ------------------------------------------------------------
+        # WATCHLIST ACTIONS
+        # ------------------------------------------------------------
+
+        if path == "/watchlist/add":
+            series_id = query.get(
+                "series_id",
+                [""],
+            )[0]
+
+            if set_series_watching(
+                series_id,
+                True,
+            ):
+                send_json(
+                    self,
+                    200,
+                    {
+                        "status": "ok",
+                        "watching": True,
+                        "series_id": series_id,
+                    },
+                )
+            else:
+                send_json(
+                    self,
+                    404,
+                    {
+                        "status": "error",
+                        "error": (
+                            "series_not_found"
+                        ),
+                    },
+                )
+
+            return
+
+        if path == "/watchlist/remove":
+            series_id = query.get(
+                "series_id",
+                [""],
+            )[0]
+
+            if set_series_watching(
+                series_id,
+                False,
+            ):
+                send_json(
+                    self,
+                    200,
+                    {
+                        "status": "ok",
+                        "watching": False,
+                        "series_id": series_id,
+                    },
+                )
+            else:
+                send_json(
+                    self,
+                    404,
+                    {
+                        "status": "error",
+                        "error": (
+                            "series_not_found"
+                        ),
+                    },
+                )
+
+            return
+
+        # ------------------------------------------------------------
+        # EPISODE WATCHED
+        # ------------------------------------------------------------
+
+        if path == "/episode/watched":
+            series_id = query.get(
+                "series_id",
+                [""],
+            )[0]
+
+            episode_id = query.get(
+                "episode_id",
+                [""],
+            )[0]
+
+            watched_value = query.get(
+                "watched",
+                ["1"],
+            )[0]
+
+            watched = (
+                watched_value
+                not in {
+                    "0",
+                    "false",
+                    "False",
+                    "no",
+                }
+            )
+
+            success = mark_episode_watched(
+                series_id,
+                episode_id,
+                watched,
+            )
+
+            if success:
+                send_json(
+                    self,
+                    200,
+                    {
+                        "status": "ok",
+                        "series_id": series_id,
+                        "episode_id": episode_id,
+                        "watched": watched,
+                    },
+                )
+            else:
+                send_json(
+                    self,
+                    404,
+                    {
+                        "status": "error",
+                        "error": (
+                            "series_or_episode_not_found"
+                        ),
+                    },
+                )
+
+            return
+
+        # ------------------------------------------------------------
+        # XTREAM API
         # ------------------------------------------------------------
 
         if path == "/player_api.php":
@@ -3248,7 +4122,7 @@ class StreamHubHandler(
             return
 
         # ------------------------------------------------------------
-        # M3U playlists
+        # M3U
         # ------------------------------------------------------------
 
         playlist_types = {
@@ -3263,16 +4137,47 @@ class StreamHubHandler(
                 200,
                 build_m3u(
                     self,
-                    playlist_types[
-                        path
-                    ],
+                    playlist_types[path],
                 ),
                 "audio/x-mpegurl; charset=utf-8",
             )
             return
 
         # ------------------------------------------------------------
-        # Unknown endpoint
+        # PROXY PLACEHOLDER
+        # ------------------------------------------------------------
+        #
+        # Bewust nog niet geïmplementeerd.
+        # Dit wordt de volgende stap:
+        #
+        # /live/<id>.ts
+        # /movie/<id>.<ext>
+        # /series/<id>.<ext>
+        #
+        # ------------------------------------------------------------
+
+        if (
+            path.startswith("/live/")
+            or path.startswith("/movie/")
+            or path.startswith("/series/")
+        ):
+            send_json(
+                self,
+                501,
+                {
+                    "status": "not_ready",
+                    "error": (
+                        "stream_proxy_not_implemented"
+                    ),
+                    "message": (
+                        "Stream proxy is part of the next release."
+                    ),
+                },
+            )
+            return
+
+        # ------------------------------------------------------------
+        # NOT FOUND
         # ------------------------------------------------------------
 
         send_json(
@@ -3292,7 +4197,11 @@ class StreamHubHandler(
 def start_server():
     ensure_directories()
 
-    servers = configured_servers()
+    # Zorg dat de state meteen bestaat.
+    if not SERIES_STATE_FILE.exists():
+        save_series_state(
+            default_series_state()
+        )
 
     LOGGER.info(
         "%s %s starting on %s:%d",
@@ -3304,7 +4213,9 @@ def start_server():
 
     LOGGER.info(
         "Configured IPTV providers: %d",
-        len(servers),
+        len(
+            configured_servers()
+        ),
     )
 
     LOGGER.info(
@@ -3312,45 +4223,31 @@ def start_server():
         CACHE_DIR,
     )
 
+    LOGGER.info(
+        "Persistent series state: %s",
+        SERIES_STATE_FILE,
+    )
+
     filter_info = (
         content_filter_description()
     )
 
-    if filter_info["mode"] == "ALL":
-        LOGGER.info(
-            "Content filter: ALL"
-        )
-    else:
-        LOGGER.info(
-            "Content filter: %s (%s)",
-            filter_info["mode"],
-            filter_info["marker"],
-        )
-
-    if CONFIG.get(
-        "public_host"
-    ):
-        LOGGER.info(
-            "Public host configured"
-        )
-    else:
-        LOGGER.info(
-            "Public host will be determined from the request"
-        )
-
-    http_server = ThreadingHTTPServer(
-        (
-            HOST,
-            PORT,
-        ),
-        StreamHubHandler,
+    LOGGER.info(
+        "Content filter: %s",
+        filter_info["mode"],
     )
 
-    STATE[
-        "started"
-    ] = True
-
     check_all_servers()
+
+    # Bestaande series-cache opnieuw koppelen aan state.
+    try:
+        if CACHE_FILES["series"].exists():
+            update_series_state_from_cache()
+    except Exception as exc:
+        LOGGER.warning(
+            "Unable to initialize series state: %s",
+            type(exc).__name__,
+        )
 
     prewarm = threading.Thread(
         target=prewarm_thread,
@@ -3367,6 +4264,18 @@ def start_server():
     )
 
     health_thread.start()
+
+    http_server = ThreadingHTTPServer(
+        (
+            HOST,
+            PORT,
+        ),
+        StreamHubHandler,
+    )
+
+    STATE[
+        "started"
+    ] = True
 
     try:
         http_server.serve_forever()
