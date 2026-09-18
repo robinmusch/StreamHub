@@ -1,7 +1,7 @@
 name: "StreamHub"
 version: "1.0.0"
 slug: "streamhub"
-description: "Multi-provider IPTV hub with Dutch content filtering, persistent caching and automatic failover."
+description: "Multi-provider IPTV hub with configurable content filtering, persistent caching and automatic failover."
 url: "https://github.com/robinmusch/streamhub"
 
 arch:
@@ -29,7 +29,8 @@ options:
   server_password: ""
   proxy_access_key: ""
 
-  country_marker: "┃NL┃"
+  content_filter: "ALL"
+  custom_marker: ""
 
   # Cacheduur is instelbaar via de Home Assistant app-configuratie.
   tv_cache_hours: 24
@@ -56,7 +57,22 @@ schema:
   server_password: password
   proxy_access_key: password
 
-  country_marker: str
+  content_filter: list(
+    ALL|
+    NL|
+    BE|
+    DE|
+    FR|
+    UK|
+    US|
+    ES|
+    IT|
+    PT|
+    TR|
+    CUSTOM
+  )
+
+  custom_marker: str
 
   tv_cache_hours: int
   movies_cache_hours: int
