@@ -76,6 +76,7 @@ jobs:
           from pathlib import Path
 
           path = Path("streamhub/config.yaml")
+
           data = yaml.safe_load(
               path.read_text(encoding="utf-8")
           )
@@ -118,7 +119,8 @@ jobs:
               "server_username",
               "server_password",
               "proxy_access_key",
-              "country_marker",
+              "content_filter",
+              "custom_marker",
               "tv_cache_hours",
               "movies_cache_hours",
               "series_cache_hours",
@@ -131,7 +133,10 @@ jobs:
               "epg_url",
           ]
 
-          options = data.get("options", {})
+          options = data.get(
+              "options",
+              {}
+          )
 
           missing_options = [
               key
@@ -145,7 +150,10 @@ jobs:
                   + ", ".join(missing_options)
               )
 
-          schema = data.get("schema", {})
+          schema = data.get(
+              "schema",
+              {}
+          )
 
           missing_schema = [
               key
@@ -157,6 +165,51 @@ jobs:
               raise SystemExit(
                   "Missing schema keys: "
                   + ", ".join(missing_schema)
+              )
+
+          if options.get("content_filter") != "ALL":
+              raise SystemExit(
+                  "Default content_filter must be ALL"
+              )
+
+          allowed_filters = {
+              "ALL",
+              "NL",
+              "BE",
+              "DE",
+              "FR",
+              "UK",
+              "US",
+              "ES",
+              "IT",
+              "PT",
+              "TR",
+              "CUSTOM",
+          }
+
+          schema_filter = str(
+              schema.get("content_filter", "")
+          )
+
+          if "ALL" not in schema_filter:
+              raise SystemExit(
+                  "content_filter schema must contain ALL"
+              )
+
+          for value in allowed_filters:
+              if value not in schema_filter:
+                  raise SystemExit(
+                      f"content_filter schema is missing {value}"
+                  )
+
+          if "country_marker" in options:
+              raise SystemExit(
+                  "Old country_marker option must not exist"
+              )
+
+          if "country_marker" in schema:
+              raise SystemExit(
+                  "Old country_marker schema must not exist"
               )
 
           print(
@@ -171,11 +224,15 @@ jobs:
           from pathlib import Path
 
           path = Path("streamhub/config.yaml")
+
           data = yaml.safe_load(
               path.read_text(encoding="utf-8")
           )
 
-          options = data.get("options", {})
+          options = data.get(
+              "options",
+              {}
+          )
 
           if options.get("servers") not in ([], None):
               raise SystemExit(
@@ -183,25 +240,36 @@ jobs:
                   "to the public repository."
               )
 
-          if options.get("server_username", "") not in ("", None):
+          if options.get(
+              "server_username",
+              ""
+          ) not in ("", None):
               raise SystemExit(
                   "Provider username must not be committed "
                   "to the public repository."
               )
 
-          if options.get("server_password", "") not in ("", None):
+          if options.get(
+              "server_password",
+              ""
+          ) not in ("", None):
               raise SystemExit(
                   "Provider password must not be committed "
                   "to the public repository."
               )
 
-          if options.get("proxy_access_key", "") not in ("", None):
+          if options.get(
+              "proxy_access_key",
+              ""
+          ) not in ("", None):
               raise SystemExit(
                   "Proxy access key must not be committed "
                   "to the public repository."
               )
 
-          print("Hardcoded secret validation: OK")
+          print(
+              "Hardcoded secret validation: OK"
+          )
           PY
 
       - name: Check for provider URLs
@@ -217,6 +285,26 @@ jobs:
           fi
 
           echo "Provider URL scan: OK"
+
+      - name: Check StreamHub content filter implementation
+        run: |
+          grep -q 'content_filter' streamhub/app.py
+          grep -q 'custom_marker' streamhub/app.py
+          grep -q 'CONTENT_MARKERS' streamhub/app.py
+          grep -q '"NL": "┃NL┃"' streamhub/app.py
+          grep -q '"BE": "┃BE┃"' streamhub/app.py
+          grep -q '"DE": "┃DE┃"' streamhub/app.py
+          grep -q '"FR": "┃FR┃"' streamhub/app.py
+          grep -q '"UK": "┃UK┃"' streamhub/app.py
+          grep -q '"US": "┃US┃"' streamhub/app.py
+          grep -q '"ES": "┃ES┃"' streamhub/app.py
+          grep -q '"IT": "┃IT┃"' streamhub/app.py
+          grep -q '"PT": "┃PT┃"' streamhub/app.py
+          grep -q '"TR": "┃TR┃"' streamhub/app.py
+          grep -q '"CUSTOM"' streamhub/app.py
+          grep -q '"ALL"' streamhub/app.py
+
+          echo "Content filter implementation validation: OK"
 
       - name: Validation complete
         run: |
