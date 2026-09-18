@@ -32,7 +32,6 @@ options:
   content_filter: "ALL"
   custom_marker: ""
 
-  # Cacheduur is instelbaar via de Home Assistant app-configuratie.
   tv_cache_hours: 24
   movies_cache_hours: 12
   series_cache_hours: 12
@@ -57,21 +56,7 @@ schema:
   server_password: password
   proxy_access_key: password
 
-  content_filter: list(
-    ALL|
-    NL|
-    BE|
-    DE|
-    FR|
-    UK|
-    US|
-    ES|
-    IT|
-    PT|
-    TR|
-    CUSTOM
-  )
-
+  content_filter: "list(ALL|NL|BE|DE|FR|UK|US|ES|IT|PT|TR|CUSTOM)"
   custom_marker: str
 
   tv_cache_hours: int
