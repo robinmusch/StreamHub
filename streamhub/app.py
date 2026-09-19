@@ -19,7 +19,7 @@ from xml.etree import ElementTree
 
 
 APP_NAME = "StreamHub"
-APP_VERSION = "2.0.12"
+APP_VERSION = "2.0.14"
 
 HOST = "0.0.0.0"
 PORT = 8088
@@ -2701,19 +2701,36 @@ def fetch_series_detail(
 
 
 def build_series_cache():
-    """Build only the Series catalog. Episode details are loaded lazily on demand."""
+    """
+    Build the complete Series cache, including episode details, while
+    keeping the episode payload bounded in memory.
+
+    The catalogue itself is collected first. Episode details are then
+    fetched in small batches and streamed directly into the persistent
+    cache. The existing cache remains untouched until the complete
+    replacement cache has been written successfully.
+    """
     server, priority = get_active_provider_snapshot()
 
     if not server:
         raise RuntimeError("no_healthy_provider")
 
-    LOGGER.info("Building series catalog using P%d", priority)
+    LOGGER.info(
+        "Building complete series cache using P%d",
+        priority,
+    )
 
-    categories = fetch_xtream_action(server, "get_series_categories")
+    categories = fetch_xtream_action(
+        server,
+        "get_series_categories",
+    )
+
     category_names = category_map(categories)
+
     if not category_names:
         raise RuntimeError("no_series_categories")
 
+    # Build the lightweight catalogue first.
     series_items = []
     seen = set()
 
@@ -2734,10 +2751,15 @@ def build_series_cache():
                 category_name,
                 priority,
             )
+
             if not normalized:
                 continue
 
-            item_id = streamhub_id("series", normalized)
+            item_id = streamhub_id(
+                "series",
+                normalized,
+            )
+
             if item_id in seen:
                 continue
 
@@ -2747,21 +2769,151 @@ def build_series_cache():
     if not series_items:
         raise RuntimeError("no_matching_series_items")
 
+    workers = max(
+        1,
+        min(
+            safe_int(
+                CONFIG.get("series_workers", 1),
+                1,
+            ),
+            4,
+        ),
+    )
+
+    delay = max(
+        0.0,
+        safe_float(
+            CONFIG.get("series_request_delay", 1.5),
+            1.5,
+        ),
+    )
+
+    # Small batches are intentional: thousands of Futures and episode
+    # payloads must never accumulate in RAM.
+    batch_size = max(
+        1,
+        min(20, workers * 5),
+    )
+
+    total_series = len(series_items)
+
+    LOGGER.info(
+        "Series catalogue: %d item(s), workers=%d, delay=%.2fs, batch=%d",
+        total_series,
+        workers,
+        delay,
+        batch_size,
+    )
+
+    def detailed_series_generator():
+        completed = 0
+        written = 0
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for batch_start in range(
+                0,
+                total_series,
+                batch_size,
+            ):
+                batch = series_items[
+                    batch_start:batch_start + batch_size
+                ]
+
+                futures = [
+                    executor.submit(
+                        fetch_series_detail,
+                        server,
+                        priority,
+                        series,
+                        delay,
+                    )
+                    for series in batch
+                ]
+
+                for future in as_completed(futures):
+                    completed += 1
+
+                    try:
+                        result = future.result()
+
+                        if result:
+                            written += 1
+                            yield result
+
+                    except Exception as exc:
+                        LOGGER.warning(
+                            "Series worker failed: %s",
+                            type(exc).__name__,
+                        )
+
+                    if completed % 100 == 0:
+                        LOGGER.info(
+                            "Series progress: %d/%d processed, %d written",
+                            completed,
+                            total_series,
+                            written,
+                        )
+
+                del futures
+                del batch
+
+                pause_every = max(
+                    0,
+                    safe_int(
+                        CONFIG.get("series_pause_every", 500),
+                        500,
+                    ),
+                )
+
+                pause_seconds = max(
+                    0.0,
+                    safe_float(
+                        CONFIG.get("series_pause_seconds", 2.0),
+                        2.0,
+                    ),
+                )
+
+                if (
+                    pause_every > 0
+                    and completed % pause_every == 0
+                    and pause_seconds > 0
+                ):
+                    LOGGER.info(
+                        "Series throttle pause: %.1fs",
+                        pause_seconds,
+                    )
+                    time.sleep(pause_seconds)
+
+        LOGGER.info(
+            "Series detail processing finished: %d/%d processed, %d written",
+            completed,
+            total_series,
+            written,
+        )
+
     written = write_series_cache_streaming(
-        series_items,
+        detailed_series_generator(),
         priority,
     )
 
+    if written <= 0:
+        raise RuntimeError("no_series_details")
+
+    try:
+        update_series_state_from_cache()
+    except Exception as exc:
+        LOGGER.warning(
+            "Series state rebuild failed after cache build: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+
     LOGGER.info(
-        "Series catalog written: %d item(s); episode details are lazy-loaded",
+        "Series cache written: %d item(s) including episode details",
         written,
     )
 
-    # Do NOT rebuild the complete episode state here. That would defeat the
-    # purpose of keeping episode payloads out of the catalog cache and can
-    # create a huge in-memory state file. Existing watch state is preserved.
     return written
-
 
 def refresh_cache_type(cache_type):
     if cache_type == "tv":
