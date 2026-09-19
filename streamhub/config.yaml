@@ -1,56 +1,79 @@
-name: "StreamHub"
-version: "1.3.0"
-slug: "streamhub"
-description: "Multi-provider IPTV hub with configurable content filtering, persistent caching and automatic failover."
-url: "https://github.com/robinmusch/streamhub"
+name: StreamHub
+version: "1.4.0"
+slug: streamhub
+description: IPTV StreamHub with provider selection, caching, failover, Series State and stream proxy
+url: https://github.com/robinmusch/streamhub
+startup: services
+boot: auto
+init: false
 
 arch:
   - aarch64
   - amd64
 
-startup: application
-boot: auto
-init: false
-
 ports:
   8088/tcp: 8088
 
 ports_description:
-  8088/tcp: "StreamHub HTTP API"
+  8088/tcp: StreamHub HTTP API
 
-watchdog: "http://[HOST]:[PORT:8088]/health"
+map:
+  - type: data
+    read_only: false
 
 options:
-  public_host: ""
+  access_key: ""
 
-  servers: []
-
-  server_username: ""
-  server_password: ""
-  proxy_access_key: ""
-
-  # Provider selection
-  # AUTO = automatically select the provider with the lowest
-  # successful API response time.
-  # FORCED = use forced_provider_priority when available.
   provider_mode: "AUTO"
   forced_provider_priority: 0
 
-  # Content filtering
-  content_filter: "ALL"
-  custom_marker: ""
+  providers: []
 
-  # Persistent cache
-  tv_cache_hours: 24
-  movies_cache_hours: 12
-  series_cache_hours: 12
+  content_filter:
+    enabled: true
+    countries:
+      - NL
+      - BE
+      - DE
+      - FR
+      - UK
+      - US
+      - ES
+      - IT
+      - PT
+      - TR
+      - CUSTOM
+      - ALL
 
-  # Provider health monitoring
+  cache:
+    enabled: true
+
+    tv:
+      enabled: true
+      ttl_hours: 24
+
+    movies:
+      enabled: true
+      ttl_hours: 12
+
+    series:
+      enabled: true
+      ttl_hours: 12
+
   health_check_seconds: 900
   backup_health_check_seconds: 21600
   health_timeout_seconds: 8
 
-  # Series processing
+  # Stream proxy
+  stream_proxy:
+    enabled: true
+    connect_timeout_seconds: 8
+    read_timeout_seconds: 30
+    chunk_size: 65536
+    retry_failed_provider: true
+    max_provider_retries: 0
+
+  # Series State
   series_workers: 1
   series_request_delay: 1.5
 
@@ -59,28 +82,49 @@ options:
   epg_url: ""
 
 schema:
-  public_host: str
+  access_key: password
 
-  servers:
-    - str
-
-  server_username: str
-  server_password: password
-  proxy_access_key: password
-
-  provider_mode: "list(AUTO|FORCED)"
+  provider_mode: list(AUTO|FORCED)
   forced_provider_priority: int
 
-  content_filter: "list(ALL|NL|BE|DE|FR|UK|US|ES|IT|PT|TR|CUSTOM)"
-  custom_marker: str
+  providers:
+    - name: str
+      priority: int
+      url: str
+      username: password
+      password: password
 
-  tv_cache_hours: int
-  movies_cache_hours: int
-  series_cache_hours: int
+  content_filter:
+    enabled: bool
+    countries:
+      - str
+
+  cache:
+    enabled: bool
+
+    tv:
+      enabled: bool
+      ttl_hours: int
+
+    movies:
+      enabled: bool
+      ttl_hours: int
+
+    series:
+      enabled: bool
+      ttl_hours: int
 
   health_check_seconds: int
   backup_health_check_seconds: int
   health_timeout_seconds: int
+
+  stream_proxy:
+    enabled: bool
+    connect_timeout_seconds: int
+    read_timeout_seconds: int
+    chunk_size: int
+    retry_failed_provider: bool
+    max_provider_retries: int
 
   series_workers: int
   series_request_delay: float
