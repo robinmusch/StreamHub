@@ -18,7 +18,7 @@ from xml.etree import ElementTree
 
 
 APP_NAME = "StreamHub"
-APP_VERSION = "2.0.8"
+APP_VERSION = "2.0.9"
 
 HOST = "0.0.0.0"
 PORT = 8088
@@ -5326,6 +5326,7 @@ def startup_background_worker():
             "Provider health initialization failed: %s: %s",
             type(exc).__name__,
             exc,
+            exc_info=True,
         )
 
     try:
@@ -5335,6 +5336,7 @@ def startup_background_worker():
             "EPG initialization failed: %s: %s",
             type(exc).__name__,
             exc,
+            exc_info=True,
         )
 
     try:
@@ -5359,6 +5361,7 @@ def startup_background_worker():
                     cache_type,
                     type(exc).__name__,
                     exc,
+                    exc_info=True,
                 )
                 fresh = False
 
@@ -5371,9 +5374,42 @@ def startup_background_worker():
                 )
                 refresh_needed.append(cache_type)
 
+        # refresh_cache_type() is the existing dispatcher and needs the
+        # active provider context; use the same call path as manual refresh.
         for cache_type in refresh_needed:
             try:
-                refresh_cache_type(cache_type)
+                priority = int(STATE.get("active_server", 0) or 0)
+                if priority <= 0:
+                    LOGGER.warning(
+                        "Skipping %s cache build: no active IPTV provider",
+                        cache_type,
+                    )
+                    continue
+
+                server = next(
+                    (
+                        item["url"]
+                        for item in STATE.get("servers", [])
+                        if int(item.get("priority", 0)) == priority
+                    ),
+                    None,
+                )
+
+                if not server:
+                    LOGGER.warning(
+                        "Skipping %s cache build: active provider P%d "
+                        "has no configured server",
+                        cache_type,
+                        priority,
+                    )
+                    continue
+
+                if cache_type == "tv":
+                    build_tv_cache(server, priority)
+                elif cache_type == "movies":
+                    build_movies_cache(server, priority)
+                elif cache_type == "series":
+                    build_series_cache(server, priority)
             except Exception as exc:
                 LOGGER.error(
                     "Automatic %s cache refresh failed: %s: %s",
@@ -5387,7 +5423,7 @@ def startup_background_worker():
         # A normal restart reuses the existing state and does not rescan
         # thousands of Series/episodes.
         series_cache = CACHE_FILES["series"]
-        state_path = BASE_DIR / "series_state.json"
+        state_path = CACHE_DIR / "series_state.json"
 
         if series_cache.exists() and not state_path.exists():
             LOGGER.info(
