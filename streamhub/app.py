@@ -18,7 +18,7 @@ from xml.etree import ElementTree
 
 
 APP_NAME = "StreamHub"
-APP_VERSION = "2.0.10"
+APP_VERSION = "2.0.11"
 
 HOST = "0.0.0.0"
 PORT = 8088
@@ -2751,27 +2751,47 @@ def build_series_cache():
 
     LOGGER.info("Building series cache using P%d", priority)
 
-    categories = get_series_categories(server)
-    if categories is None:
-        raise RuntimeError("Failed to fetch series categories")
+    categories = fetch_xtream_action(server, "get_series_categories")
+    category_names = category_map(categories)
 
-    series_items = get_series_items(server, categories)
-    if series_items is None:
-        raise RuntimeError("Failed to fetch series catalogue")
+    if not category_names:
+        raise RuntimeError("no_series_categories")
 
-    filtered = []
+    series_items = []
     seen = set()
-    for series in series_items:
-        if not item_matches_content(series):
-            continue
-        normalized = normalize_series_item(series, categories)
-        key = streamhub_id("series", normalized)
-        if key in seen:
-            continue
-        seen.add(key)
-        filtered.append(normalized)
 
-    total = len(filtered)
+    for category_id, category_name in category_names.items():
+        series_list = fetch_xtream_action(
+            server,
+            "get_series",
+            {"category_id": category_id},
+        )
+
+        for series in as_list(series_list):
+            if not item_matches_content(series, category_name):
+                continue
+
+            normalized = normalize_item(
+                series,
+                "series",
+                category_name,
+                priority,
+            )
+
+            if not normalized:
+                continue
+
+            item_id = streamhub_id("series", normalized)
+            if item_id in seen:
+                continue
+
+            seen.add(item_id)
+            series_items.append(normalized)
+
+    if not series_items:
+        raise RuntimeError("no_matching_series_items")
+
+    total = len(series_items)
     workers = max(1, min(4, int(CONFIG.get("series_workers", 1))))
     delay = max(0.0, float(CONFIG.get("series_request_delay", 1.5)))
     checkpoint_every = max(1, int(CONFIG.get("series_checkpoint_every", 100)))
@@ -2783,24 +2803,39 @@ def build_series_cache():
         total, workers, delay
     )
 
-    # Keep the existing 2.0.3 checkpoint/cache approach, but bound the
-    # submitted work so the number of in-flight futures stays small.
-    checkpoint_path = BASE_DIR / "series_build_checkpoint.json"
+    checkpoint_path = CACHE_FILES["series"].with_name(
+        "series_build_checkpoint.json"
+    )
     checkpoint = load_json(checkpoint_path, default={}) or {}
-    completed_ids = set(checkpoint.get("completed_ids", []))
 
+    if int(checkpoint.get("provider_priority", priority)) != priority:
+        checkpoint = {}
+
+    completed_ids = set(checkpoint.get("completed_ids", []))
     processed = int(checkpoint.get("processed", 0))
     written = int(checkpoint.get("written", 0))
     failed = int(checkpoint.get("failed", 0))
 
     temp_path = CACHE_FILES["series"].with_suffix(".json.partial")
 
+    if not checkpoint and temp_path.exists():
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+
     if not temp_path.exists():
         with temp_path.open("w", encoding="utf-8") as fh:
-            fh.write('{"updated_at":')
-            json.dump(now_iso(), fh, ensure_ascii=False)
+            fh.write('{"version":2,"type":"series","created_at":')
+            fh.write(str(now_unix()))
             fh.write(',"provider_priority":')
             json.dump(priority, fh)
+            fh.write(',"content_filter":')
+            json.dump(
+                content_filter_description(),
+                fh,
+                ensure_ascii=False,
+            )
             fh.write(',"items":[')
 
     has_items = False
@@ -2815,30 +2850,40 @@ def build_series_cache():
     except OSError:
         pass
 
-    # Process bounded batches. Workers remains configurable; default is 1.
     batch_size = max(workers, min(20, workers * 5))
 
     for batch_start in range(0, total, batch_size):
-        batch = []
-        for series in filtered[batch_start:batch_start + batch_size]:
-            item_id = streamhub_id("series", series)
-            if item_id not in completed_ids:
-                batch.append((item_id, series))
+        batch = [
+            (streamhub_id("series", series), series)
+            for series in series_items[
+                batch_start:batch_start + batch_size
+            ]
+            if streamhub_id("series", series) not in completed_ids
+        ]
 
         if not batch:
             continue
 
+        batch_index = {
+            item_id: index
+            for index, (item_id, _series) in enumerate(batch)
+        }
+
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_map = {
                 executor.submit(
-                    fetch_series_detail, server, priority, series, delay
-                ): (item_id, series)
+                    fetch_series_detail,
+                    server,
+                    priority,
+                    series,
+                    delay,
+                ): item_id
                 for item_id, series in batch
             }
 
             for future in as_completed(future_map):
-                item_id, series = future_map[future]
-                item_number = batch_start + batch.index((item_id, series)) + 1
+                item_id = future_map[future]
+                item_number = batch_start + batch_index[item_id] + 1
 
                 try:
                     result = future.result()
@@ -2846,18 +2891,20 @@ def build_series_cache():
                     failed += 1
                     LOGGER.warning(
                         "Series item %d/%d failed (%s): %s",
-                        item_number, total, item_id, exc
+                        item_number, total, item_id, exc,
                     )
                     result = None
 
                 if result:
-                    payload = json.dumps(
-                        result, ensure_ascii=False, separators=(",", ":")
-                    )
                     with temp_path.open("a", encoding="utf-8") as fh:
                         if has_items:
                             fh.write(",")
-                        fh.write(payload)
+                        json.dump(
+                            result,
+                            fh,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
                         fh.flush()
                         os.fsync(fh.fileno())
                     has_items = True
@@ -2865,7 +2912,6 @@ def build_series_cache():
 
                 completed_ids.add(item_id)
                 processed += 1
-                result = None
 
                 if processed % checkpoint_every == 0 or processed == total:
                     atomic_write_json(
@@ -2883,12 +2929,13 @@ def build_series_cache():
                     )
                     LOGGER.info(
                         "Series progress: %d/%d processed, %d written, %d failed",
-                        processed, total, written, failed
+                        processed, total, written, failed,
                     )
 
                 if processed % pause_every == 0 and pause_seconds > 0:
                     LOGGER.info(
-                        "Series throttle pause: %.1fs", pause_seconds
+                        "Series throttle pause: %.1fs",
+                        pause_seconds,
                     )
                     time.sleep(pause_seconds)
                     gc.collect()
@@ -2909,12 +2956,13 @@ def build_series_cache():
 
     LOGGER.info(
         "Series cache written: %d item(s), %d failed",
-        written, failed
+        written, failed,
     )
     LOGGER.info(
-        "Series state rebuild skipped after cache refresh; "
-        "existing state preserved"
+        "Series state rebuild skipped after cache refresh; existing state preserved"
     )
+
+    return written
 
 def refresh_cache_type(cache_type):
     if cache_type == "tv":
