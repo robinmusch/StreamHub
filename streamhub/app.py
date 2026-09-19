@@ -2697,39 +2697,66 @@ def build_series_cache():
         ),
     )
 
+    # Verwerk Series in kleine batches.
+    # We maken bewust niet voor de volledige catalogus Futures aan:
+    # bij duizenden Series kan dat onnodig veel RAM kosten.
     results = []
+    batch_size = 20
+    total_series = len(series_items)
+    completed = 0
 
     with ThreadPoolExecutor(
         max_workers=workers
     ) as executor:
 
-        futures = [
-            executor.submit(
-                fetch_series_detail,
-                server,
-                priority,
-                series,
-                delay,
-            )
-            for series in series_items
-        ]
-
-        for future in as_completed(
-            futures
+        for batch_start in range(
+            0,
+            total_series,
+            batch_size,
         ):
-            try:
-                result = future.result()
+            batch = series_items[
+                batch_start:batch_start + batch_size
+            ]
 
-                if result:
-                    results.append(
-                        result
+            futures = [
+                executor.submit(
+                    fetch_series_detail,
+                    server,
+                    priority,
+                    series,
+                    delay,
+                )
+                for series in batch
+            ]
+
+            for future in as_completed(
+                futures
+            ):
+                try:
+                    result = future.result()
+
+                    if result:
+                        results.append(
+                            result
+                        )
+
+                except Exception as exc:
+                    LOGGER.warning(
+                        "Series worker failed: %s",
+                        type(exc).__name__,
                     )
 
-            except Exception as exc:
-                LOGGER.warning(
-                    "Series worker failed: %s",
-                    type(exc).__name__,
-                )
+                finally:
+                    completed += 1
+
+            LOGGER.info(
+                "Series progress: %d/%d",
+                completed,
+                total_series,
+            )
+
+            del futures
+            del batch
 
     if not results:
         raise RuntimeError(
