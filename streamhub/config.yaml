@@ -1,5 +1,5 @@
 name: StreamHub
-version: "2.0.9"
+version: "2.0.10"
 slug: "streamhub"
 description: "Multi-provider IPTV hub with Xtream API, M3U, stream proxy, EPG, persistent caching, content filtering and automatic failover."
 url: "https://github.com/robinmusch/StreamHub"
