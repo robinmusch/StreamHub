@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 #!/usr/bin/env python3
 
 import gzip
@@ -2924,7 +2925,7 @@ def build_series_cache():
                             "written": written,
                             "failed": failed,
                             "completed_ids": list(completed_ids),
-                            "updated_at": now_iso(),
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
                         },
                     )
                     LOGGER.info(
