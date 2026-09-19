@@ -17,7 +17,7 @@ from xml.etree import ElementTree
 
 
 APP_NAME = "StreamHub"
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.0.2"
 
 HOST = "0.0.0.0"
 PORT = 8088
@@ -495,6 +495,58 @@ def read_json_file(path):
         return None
 
 
+def iter_json_array_items(path):
+    """Stream one object at a time from the cache ``items`` JSON array."""
+    decoder = json.JSONDecoder()
+
+    with path.open("r", encoding="utf-8") as file:
+        buffer = ""
+        eof = False
+
+        while True:
+            marker = buffer.find('"items"')
+            if marker >= 0:
+                start = buffer.find("[", marker)
+                if start >= 0:
+                    buffer = buffer[start + 1:]
+                    break
+
+            chunk = file.read(65536)
+            if chunk:
+                buffer += chunk
+            else:
+                eof = True
+                break
+
+            if len(buffer) > 131072:
+                buffer = buffer[-131072:]
+
+        if eof and "[" not in buffer:
+            raise ValueError("invalid_cache_items_array")
+
+        while True:
+            buffer = buffer.lstrip()
+
+            if buffer.startswith("]"):
+                return
+
+            while True:
+                try:
+                    item, end = decoder.raw_decode(buffer)
+                    break
+                except json.JSONDecodeError:
+                    chunk = file.read(65536)
+                    if chunk:
+                        buffer += chunk
+                    else:
+                        raise ValueError("invalid_cache_items_json")
+
+            if isinstance(item, dict):
+                yield item
+
+            buffer = buffer[end:]
+
+
 # ============================================================================
 # SERIES STATE
 # ============================================================================
@@ -764,8 +816,8 @@ def update_series_state_from_cache():
 
     state = load_series_state()
 
-    series_items = load_cache_items(
-        "series"
+    series_items = iter_json_array_items(
+        CACHE_FILES["series"]
     )
 
     current_series_keys = set()
@@ -1304,6 +1356,73 @@ def write_cache(
         CACHE_FILES[cache_type],
         payload,
     )
+
+
+def write_series_cache_streaming(items, provider_priority):
+    """Write Series cache incrementally so the complete catalog stays off-RAM."""
+    path = CACHE_FILES["series"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.building"
+    )
+    written = 0
+
+    try:
+        with temporary.open("w", encoding="utf-8") as file:
+            file.write("{")
+            file.write('"version":2,')
+            file.write('"type":"series",')
+            file.write(f'"created_at":{now_unix()},')
+            file.write(
+                '"provider_priority":'
+                + json.dumps(provider_priority)
+                + ","
+            )
+            file.write(
+                '"content_filter":'
+                + json.dumps(
+                    content_filter_description(),
+                    ensure_ascii=False,
+                )
+                + ","
+            )
+            file.write('"items":[')
+
+            first = True
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+
+                if not first:
+                    file.write(",")
+
+                json.dump(
+                    item,
+                    file,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                first = False
+                written += 1
+
+                if written % 100 == 0:
+                    file.flush()
+
+            file.write("]}")
+            file.flush()
+            os.fsync(file.fileno())
+
+        os.replace(temporary, path)
+
+    finally:
+        try:
+            if temporary.exists():
+                temporary.unlink()
+        except OSError:
+            pass
+
+    return written
 
 
 # ============================================================================
@@ -2607,14 +2726,10 @@ def fetch_series_detail(
 
 
 def build_series_cache():
-    server, priority = (
-        get_active_provider_snapshot()
-    )
+    server, priority = get_active_provider_snapshot()
 
     if not server:
-        raise RuntimeError(
-            "no_healthy_provider"
-        )
+        raise RuntimeError("no_healthy_provider")
 
     LOGGER.info(
         "Building series cache using P%d",
@@ -2625,29 +2740,18 @@ def build_series_cache():
         server,
         "get_series_categories",
     )
-
-    category_names = category_map(
-        categories
-    )
+    category_names = category_map(categories)
 
     series_items = []
 
-    for (
-        category_id,
-        category_name,
-    ) in category_names.items():
-
+    for category_id, category_name in category_names.items():
         series_list = fetch_xtream_action(
             server,
             "get_series",
-            {
-                "category_id": category_id
-            },
+            {"category_id": category_id},
         )
 
-        for series in as_list(
-            series_list
-        ):
+        for series in as_list(series_list):
             if not item_matches_content(
                 series,
                 category_name,
@@ -2662,26 +2766,17 @@ def build_series_cache():
             )
 
             if normalized:
-                series_items.append(
-                    normalized
-                )
+                series_items.append(normalized)
 
-    series_items = deduplicate_items(
-        series_items
-    )
+    series_items = deduplicate_items(series_items)
 
     if not series_items:
-        raise RuntimeError(
-            "no_matching_series_items"
-        )
+        raise RuntimeError("no_matching_series_items")
 
     workers = max(
         1,
         safe_int(
-            CONFIG.get(
-                "series_workers",
-                1,
-            ),
+            CONFIG.get("series_workers", 1),
             1,
         ),
     )
@@ -2689,65 +2784,83 @@ def build_series_cache():
     delay = max(
         0.0,
         safe_float(
-            CONFIG.get(
-                "series_request_delay",
-                1.5,
-            ),
+            CONFIG.get("series_request_delay", 1.5),
             1.5,
         ),
     )
 
-    # Verwerk Series in kleine batches.
-    # We maken bewust niet voor de volledige catalogus Futures aan:
-    # bij duizenden Series kan dat onnodig veel RAM kosten.
-    results = []
-    batch_size = 20
+    batch_size = max(
+        workers,
+        min(20, workers * 10),
+    )
+
     total_series = len(series_items)
-    completed = 0
 
-    with ThreadPoolExecutor(
-        max_workers=workers
-    ) as executor:
+    LOGGER.info(
+        "Series catalog contains %d item(s); processing in batches of %d",
+        total_series,
+        batch_size,
+    )
 
-        for batch_start in range(
-            0,
-            total_series,
-            batch_size,
-        ):
+    def result_iterator():
+        completed = 0
+        seen = set()
+
+        for batch_start in range(0, total_series, batch_size):
             batch = series_items[
                 batch_start:batch_start + batch_size
             ]
 
-            futures = [
-                executor.submit(
-                    fetch_series_detail,
-                    server,
-                    priority,
-                    series,
-                    delay,
-                )
-                for series in batch
-            ]
+            with ThreadPoolExecutor(
+                max_workers=workers
+            ) as executor:
+                futures = [
+                    executor.submit(
+                        fetch_series_detail,
+                        server,
+                        priority,
+                        series,
+                        delay,
+                    )
+                    for series in batch
+                ]
 
-            for future in as_completed(
-                futures
-            ):
-                try:
-                    result = future.result()
+                for future in as_completed(futures):
+                    try:
+                        result = future.result()
 
-                    if result:
-                        results.append(
-                            result
+                        if result:
+                            name = normalize_identity_text(
+                                result.get("name", "")
+                                or result.get("title", "")
+                            )
+                            category = normalize_identity_text(
+                                result.get(
+                                    "_streamhub",
+                                    {},
+                                ).get(
+                                    "category_name",
+                                    "",
+                                )
+                            )
+                            key = (
+                                "series",
+                                category,
+                                name,
+                            )
+
+                            if key not in seen:
+                                seen.add(key)
+                                yield result
+
+                    except Exception as exc:
+                        LOGGER.warning(
+                            "Series worker failed: %s",
+                            type(exc).__name__,
                         )
 
-                except Exception as exc:
-                    LOGGER.warning(
-                        "Series worker failed: %s",
-                        type(exc).__name__,
-                    )
-
-                finally:
-                    completed += 1
+                    finally:
+                        completed += 1
 
             LOGGER.info(
                 "Series progress: %d/%d",
@@ -2758,29 +2871,27 @@ def build_series_cache():
             del futures
             del batch
 
-    if not results:
-        raise RuntimeError(
-            "no_series_details"
-        )
-
-    results = deduplicate_items(
-        results
+    written = write_series_cache_streaming(
+        result_iterator(),
+        priority,
     )
 
-    write_cache(
-        "series",
-        results,
-        priority,
+    if not written:
+        raise RuntimeError("no_series_details")
+
+    LOGGER.info(
+        "Series cache written: %d item(s)",
+        written,
     )
 
     update_series_state_from_cache()
 
     LOGGER.info(
-        "Series cache written: %d item(s)",
-        len(results),
+        "Series state updated: %d item(s)",
+        written,
     )
 
-    return len(results)
+    return written
 
 
 # ============================================================================
