@@ -6,6 +6,7 @@ url: https://github.com/robinmusch/streamhub
 startup: services
 boot: auto
 init: false
+watchdog: http://127.0.0.1:8088/status
 
 arch:
   - aarch64
@@ -64,7 +65,6 @@ options:
   backup_health_check_seconds: 21600
   health_timeout_seconds: 8
 
-  # Stream proxy
   stream_proxy:
     enabled: true
     connect_timeout_seconds: 8
@@ -73,11 +73,9 @@ options:
     retry_failed_provider: true
     max_provider_retries: 0
 
-  # Series State
   series_workers: 1
   series_request_delay: 1.5
 
-  # EPG
   epg_enabled: true
   epg_url: ""
 
