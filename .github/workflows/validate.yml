@@ -452,9 +452,9 @@ jobs:
       # ------------------------------------------------------------
       - name: Check StreamHub application version
         run: |
-          grep -q 'APP_VERSION = "2.0.1"' streamhub/app.py
+          grep -q 'APP_VERSION = "2.0.2"' streamhub/app.py
 
-          echo "StreamHub application version: 2.0.1"
+          echo "StreamHub application version: 2.0.2"
 
       # ------------------------------------------------------------
       # API routes
@@ -676,5 +676,5 @@ jobs:
         run: |
           echo "======================================"
           echo "StreamHub validation completed"
-          echo "Version: 2.0.1"
+          echo "Version: 2.0.2"
           echo "======================================"
