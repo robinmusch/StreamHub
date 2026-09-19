@@ -1,7 +1,5 @@
 #!/bin/sh
-
 set -e
 
-echo "Starting StreamHub 2.0.7..."
-
+echo "Starting StreamHub..."
 exec python3 /app/app.py
