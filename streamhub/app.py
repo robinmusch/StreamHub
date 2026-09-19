@@ -19,7 +19,7 @@ from xml.etree import ElementTree
 
 
 APP_NAME = "StreamHub"
-APP_VERSION = "2.0.11"
+APP_VERSION = "2.0.12"
 
 HOST = "0.0.0.0"
 PORT = 8088
@@ -2669,10 +2669,8 @@ def fetch_series_detail(
     series,
     delay,
 ):
-    series_id = series.get(
-        "series_id"
-    )
-
+    """Fetch one Series detail on demand. Kept separate from the catalog cache."""
+    series_id = series.get("series_id")
     if series_id is None:
         return None
 
@@ -2683,78 +2681,36 @@ def fetch_series_detail(
         details = fetch_xtream_action(
             server,
             "get_series_info",
-            {
-                "series_id": series_id
-            },
+            {"series_id": series_id},
         )
+        if not isinstance(details, dict):
+            return None
 
-        result = dict(
-            series
-        )
-
-        result["info"] = (
-            details.get(
-                "info",
-                {},
-            )
-        )
-
-        result["episodes"] = (
-            details.get(
-                "episodes",
-                {},
-            )
-        )
-
-        result["seasons"] = (
-            details.get(
-                "seasons",
-                [],
-            )
-        )
-
-        result[
-            "_streamhub"
-        ] = {
-            "type": "series",
-            "provider_priority": (
-                priority
-            ),
-            "category_name": (
-                series.get(
-                    "_streamhub",
-                    {},
-                ).get(
-                    "category_name",
-                    "",
-                )
-            ),
-            "cached_at": now_unix(),
+        return {
+            "info": details.get("info", {}) if isinstance(details.get("info", {}), dict) else {},
+            "episodes": details.get("episodes", {}) if isinstance(details.get("episodes", {}), dict) else {},
+            "seasons": details.get("seasons", []) if isinstance(details.get("seasons", []), list) else [],
         }
-
-        return result
-
     except Exception as exc:
         LOGGER.warning(
-            "Series detail request failed: %s",
+            "Series detail request failed for %s: %s",
+            series_id,
             type(exc).__name__,
         )
-
         return None
 
 
 def build_series_cache():
-    """Build Series cache with bounded concurrency, checkpoints and streaming writes."""
+    """Build only the Series catalog. Episode details are loaded lazily on demand."""
     server, priority = get_active_provider_snapshot()
 
     if not server:
         raise RuntimeError("no_healthy_provider")
 
-    LOGGER.info("Building series cache using P%d", priority)
+    LOGGER.info("Building series catalog using P%d", priority)
 
     categories = fetch_xtream_action(server, "get_series_categories")
     category_names = category_map(categories)
-
     if not category_names:
         raise RuntimeError("no_series_categories")
 
@@ -2778,7 +2734,6 @@ def build_series_cache():
                 category_name,
                 priority,
             )
-
             if not normalized:
                 continue
 
@@ -2792,178 +2747,21 @@ def build_series_cache():
     if not series_items:
         raise RuntimeError("no_matching_series_items")
 
-    total = len(series_items)
-    workers = max(1, min(4, int(CONFIG.get("series_workers", 1))))
-    delay = max(0.0, float(CONFIG.get("series_request_delay", 1.5)))
-    checkpoint_every = max(1, int(CONFIG.get("series_checkpoint_every", 100)))
-    pause_every = max(checkpoint_every, int(CONFIG.get("series_pause_every", 500)))
-    pause_seconds = max(0.0, float(CONFIG.get("series_pause_seconds", 2.0)))
+    written = write_series_cache_streaming(
+        series_items,
+        priority,
+    )
 
     LOGGER.info(
-        "Series catalogue: %d item(s), workers=%d, delay=%.2fs",
-        total, workers, delay
+        "Series catalog written: %d item(s); episode details are lazy-loaded",
+        written,
     )
 
-    checkpoint_path = CACHE_FILES["series"].with_name(
-        "series_build_checkpoint.json"
-    )
-    checkpoint = read_json_file(checkpoint_path) or {}
-
-    if int(checkpoint.get("provider_priority", priority)) != priority:
-        checkpoint = {}
-
-    completed_ids = set(checkpoint.get("completed_ids", []))
-    processed = int(checkpoint.get("processed", 0))
-    written = int(checkpoint.get("written", 0))
-    failed = int(checkpoint.get("failed", 0))
-
-    temp_path = CACHE_FILES["series"].with_suffix(".json.partial")
-
-    if not checkpoint and temp_path.exists():
-        try:
-            temp_path.unlink()
-        except OSError:
-            pass
-
-    if not temp_path.exists():
-        with temp_path.open("w", encoding="utf-8") as fh:
-            fh.write('{"version":2,"type":"series","created_at":')
-            fh.write(str(now_unix()))
-            fh.write(',"provider_priority":')
-            json.dump(priority, fh)
-            fh.write(',"content_filter":')
-            json.dump(
-                content_filter_description(),
-                fh,
-                ensure_ascii=False,
-            )
-            fh.write(',"items":[')
-
-    has_items = False
-    try:
-        with temp_path.open("rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            size = fh.tell()
-            if size > 0:
-                fh.seek(max(0, size - 4096))
-                tail = fh.read().decode("utf-8", errors="ignore").rstrip()
-                has_items = not tail.endswith("[")
-    except OSError:
-        pass
-
-    batch_size = max(workers, min(20, workers * 5))
-
-    for batch_start in range(0, total, batch_size):
-        batch = [
-            (streamhub_id("series", series), series)
-            for series in series_items[
-                batch_start:batch_start + batch_size
-            ]
-            if streamhub_id("series", series) not in completed_ids
-        ]
-
-        if not batch:
-            continue
-
-        batch_index = {
-            item_id: index
-            for index, (item_id, _series) in enumerate(batch)
-        }
-
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            future_map = {
-                executor.submit(
-                    fetch_series_detail,
-                    server,
-                    priority,
-                    series,
-                    delay,
-                ): item_id
-                for item_id, series in batch
-            }
-
-            for future in as_completed(future_map):
-                item_id = future_map[future]
-                item_number = batch_start + batch_index[item_id] + 1
-
-                try:
-                    result = future.result()
-                except Exception as exc:
-                    failed += 1
-                    LOGGER.warning(
-                        "Series item %d/%d failed (%s): %s",
-                        item_number, total, item_id, exc,
-                    )
-                    result = None
-
-                if result:
-                    with temp_path.open("a", encoding="utf-8") as fh:
-                        if has_items:
-                            fh.write(",")
-                        json.dump(
-                            result,
-                            fh,
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        )
-                        fh.flush()
-                        os.fsync(fh.fileno())
-                    has_items = True
-                    written += 1
-
-                completed_ids.add(item_id)
-                processed += 1
-
-                if processed % checkpoint_every == 0 or processed == total:
-                    atomic_write_json(
-                        checkpoint_path,
-                        {
-                            "version": 1,
-                            "provider_priority": priority,
-                            "total": total,
-                            "processed": processed,
-                            "written": written,
-                            "failed": failed,
-                            "completed_ids": list(completed_ids),
-                            "updated_at": datetime.now(timezone.utc).isoformat(),
-                        },
-                    )
-                    LOGGER.info(
-                        "Series progress: %d/%d processed, %d written, %d failed",
-                        processed, total, written, failed,
-                    )
-
-                if processed % pause_every == 0 and pause_seconds > 0:
-                    LOGGER.info(
-                        "Series throttle pause: %.1fs",
-                        pause_seconds,
-                    )
-                    time.sleep(pause_seconds)
-                    gc.collect()
-
-        gc.collect()
-
-    with temp_path.open("a", encoding="utf-8") as fh:
-        fh.write("]}")
-        fh.flush()
-        os.fsync(fh.fileno())
-
-    os.replace(temp_path, CACHE_FILES["series"])
-
-    try:
-        checkpoint_path.unlink()
-    except FileNotFoundError:
-        pass
-
-    LOGGER.info(
-        "Series cache written: %d item(s), %d failed",
-        written, failed,
-    )
-    LOGGER.info(
-        "Series state rebuild skipped after cache refresh; existing state preserved"
-    )
-
+    # Do NOT rebuild the complete episode state here. That would defeat the
+    # purpose of keeping episode payloads out of the catalog cache and can
+    # create a huge in-memory state file. Existing watch state is preserved.
     return written
+
 
 def refresh_cache_type(cache_type):
     if cache_type == "tv":
@@ -3914,30 +3712,49 @@ def player_api_response(
                 "seasons": [],
             }
 
-        state = load_series_state()
+        server, priority = get_active_provider_snapshot()
+        if not server:
+            return {
+                "info": {},
+                "episodes": {},
+                "seasons": [],
+            }
 
-        series_state = state[
-            "series"
-        ].get(
-            series_state_key(
-                item
-            ),
+        # Series details are deliberately fetched only when the client opens
+        # a specific series. This keeps the startup/catalog refresh small and
+        # prevents thousands of episode payloads from accumulating in RAM.
+        details = fetch_series_detail(
+            server,
+            priority,
+            item,
+            0,
+        )
+
+        if not details:
+            return {
+                "info": {},
+                "episodes": {},
+                "seasons": [],
+            }
+
+        state = load_series_state()
+        series_state = state.get("series", {}).get(
+            series_state_key(item),
             {},
         )
 
+        detailed_item = dict(item)
+        detailed_item["info"] = details.get("info", {})
+        detailed_item["episodes"] = details.get("episodes", {})
+        detailed_item["seasons"] = details.get("seasons", [])
+
         return {
-            "info": item.get(
-                "info",
-                {},
-            ),
+            "info": details.get("info", {}),
             "episodes": transform_series_info(
                 request,
-                item,
+                detailed_item,
             ),
-            "seasons": item.get(
-                "seasons",
-                [],
-            ),
+            "seasons": details.get("seasons", []),
             "_streamhub": {
                 "watching": series_state.get(
                     "watching",
