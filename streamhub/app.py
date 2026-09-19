@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import gzip
+import gc
 import hashlib
 import json
 import logging
@@ -17,7 +18,7 @@ from xml.etree import ElementTree
 
 
 APP_NAME = "StreamHub"
-APP_VERSION = "2.0.3"
+APP_VERSION = "2.0.4"
 
 HOST = "0.0.0.0"
 PORT = 8088
@@ -59,6 +60,9 @@ DEFAULT_CONFIG = {
 
     "series_workers": 1,
     "series_request_delay": 1.5,
+ "series_checkpoint_every": 100,
+ "series_pause_every": 500,
+ "series_pause_seconds": 2.0,
 
     "epg_enabled": True,
     "epg_url": "",
@@ -2738,178 +2742,170 @@ def fetch_series_detail(
         return None
 
 
-def build_series_cache():
-    server, priority = get_active_provider_snapshot()
+def build_series_cache(server, priority):
+    """
+    Build the Series cache conservatively.
 
-    if not server:
-        raise RuntimeError("no_healthy_provider")
+    2.0.4 deliberately processes one Series at a time. Results are written
+    incrementally to disk so a large provider catalogue does not accumulate
+    thousands of detailed Series objects in RAM. Progress is checkpointed so
+    an interrupted build can be resumed safely.
+    """
+    LOGGER.info("Building series cache using P%d (conservative mode)", priority)
 
-    LOGGER.info(
-        "Building series cache using P%d",
-        priority,
-    )
+    categories = get_series_categories(server)
+    if categories is None:
+        raise RuntimeError("Failed to fetch series categories")
 
-    categories = fetch_xtream_action(
-        server,
-        "get_series_categories",
-    )
-    category_names = category_map(categories)
+    series_items = get_series_items(server, categories)
+    if series_items is None:
+        raise RuntimeError("Failed to fetch series catalogue")
 
-    series_items = []
+    filtered = []
+    seen = set()
 
-    for category_id, category_name in category_names.items():
-        series_list = fetch_xtream_action(
-            server,
-            "get_series",
-            {"category_id": category_id},
-        )
+    for series in series_items:
+        if not item_matches_content(series):
+            continue
+        normalized = normalize_series_item(series, categories)
+        key = streamhub_id("series", normalized)
+        if key in seen:
+            continue
+        seen.add(key)
+        filtered.append(normalized)
 
-        for series in as_list(series_list):
-            if not item_matches_content(
-                series,
-                category_name,
-            ):
-                continue
+    total = len(filtered)
+    LOGGER.info("Series catalogue after filtering/deduplication: %d item(s)", total)
 
-            normalized = normalize_item(
-                series,
-                "series",
-                category_name,
-                priority,
+    workers = 1
+    delay = max(0.0, float(CONFIG.get("series_request_delay", 1.5)))
+    checkpoint_every = max(1, int(CONFIG.get("series_checkpoint_every", 100)))
+    pause_every = max(checkpoint_every, int(CONFIG.get("series_pause_every", 500)))
+    pause_seconds = max(0.0, float(CONFIG.get("series_pause_seconds", 2.0)))
+
+    # Persistent build state. This is intentionally small: only the index,
+    # counters and completed IDs are retained, never the full Series payload.
+    checkpoint_path = BASE_DIR / "series_build_checkpoint.json"
+    checkpoint = load_json(checkpoint_path, default={}) or {}
+    completed_ids = set(checkpoint.get("completed_ids", []))
+
+    temp_path = CACHE_FILES["series"].with_suffix(".json.partial")
+    existing_items = []
+
+    # Reuse a previously written partial cache if present. We only keep the
+    # partial file on disk; no full Series catalogue is loaded into RAM.
+    if temp_path.exists():
+        LOGGER.info("Resuming Series build from partial cache: %s", temp_path)
+
+    # Start a fresh partial JSON array if needed.
+    if not temp_path.exists():
+        with temp_path.open("w", encoding="utf-8") as fh:
+            fh.write('{"updated_at":')
+            json.dump(now_iso(), fh, ensure_ascii=False)
+            fh.write(',"provider_priority":')
+            json.dump(priority, fh)
+            fh.write(',"items":[')
+
+    # Determine whether the partial file already contains objects by checking
+    # the tail only. This avoids loading the file into RAM.
+    has_items = False
+    try:
+        with temp_path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            if size > 0:
+                fh.seek(max(0, size - 4096))
+                tail = fh.read().decode("utf-8", errors="ignore").rstrip()
+                has_items = not tail.endswith("[")
+    except OSError:
+        has_items = False
+
+    processed = int(checkpoint.get("processed", 0))
+    written = int(checkpoint.get("written", 0))
+    failed = int(checkpoint.get("failed", 0))
+
+    if processed > total:
+        processed = 0
+        written = 0
+        failed = 0
+        completed_ids.clear()
+
+    for index, series in enumerate(filtered):
+        item_id = streamhub_id("series", series)
+
+        if item_id in completed_ids:
+            continue
+
+        item_number = index + 1
+        LOGGER.info("Series item %d/%d: %s", item_number, total,
+                    str(series.get("name") or series.get("title") or item_id)[:180])
+
+        result = None
+        try:
+            result = fetch_series_detail(server, priority, series, delay)
+        except Exception as exc:
+            failed += 1
+            LOGGER.warning("Series item %d failed: %s", item_number, exc)
+
+        if result:
+            payload = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+            with temp_path.open("a", encoding="utf-8") as fh:
+                if has_items:
+                    fh.write(",")
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            has_items = True
+            written += 1
+
+        completed_ids.add(item_id)
+        processed += 1
+
+        if processed % checkpoint_every == 0 or processed == total:
+            atomic_write_json(
+                checkpoint_path,
+                {
+                    "version": 1,
+                    "provider_priority": priority,
+                    "total": total,
+                    "processed": processed,
+                    "written": written,
+                    "failed": failed,
+                    "completed_ids": list(completed_ids),
+                    "updated_at": now_iso(),
+                },
             )
-
-            if normalized:
-                series_items.append(normalized)
-
-    series_items = deduplicate_items(series_items)
-
-    if not series_items:
-        raise RuntimeError("no_matching_series_items")
-
-    workers = max(
-        1,
-        safe_int(
-            CONFIG.get("series_workers", 1),
-            1,
-        ),
-    )
-
-    delay = max(
-        0.0,
-        safe_float(
-            CONFIG.get("series_request_delay", 1.5),
-            1.5,
-        ),
-    )
-
-    batch_size = max(
-        workers,
-        min(20, workers * 10),
-    )
-
-    total_series = len(series_items)
-
-    LOGGER.info(
-        "Series catalog contains %d item(s); processing in batches of %d",
-        total_series,
-        batch_size,
-    )
-
-    def result_iterator():
-        completed = 0
-        seen = set()
-
-        for batch_start in range(0, total_series, batch_size):
-            batch = series_items[
-                batch_start:batch_start + batch_size
-            ]
-
-            with ThreadPoolExecutor(
-                max_workers=workers
-            ) as executor:
-                futures = [
-                    executor.submit(
-                        fetch_series_detail,
-                        server,
-                        priority,
-                        series,
-                        delay,
-                    )
-                    for series in batch
-                ]
-
-                for future in as_completed(futures):
-                    try:
-                        result = future.result()
-
-                        if result:
-                            name = normalize_identity_text(
-                                result.get("name", "")
-                                or result.get("title", "")
-                            )
-                            category = normalize_identity_text(
-                                result.get(
-                                    "_streamhub",
-                                    {},
-                                ).get(
-                                    "category_name",
-                                    "",
-                                )
-                            )
-                            key = (
-                                "series",
-                                category,
-                                name,
-                            )
-
-                            if key not in seen:
-                                seen.add(key)
-                                yield result
-
-                    except Exception as exc:
-                        LOGGER.warning(
-                            "Series worker failed: %s",
-                            type(exc).__name__,
-                        )
-
-                    finally:
-                        completed += 1
-
             LOGGER.info(
-                "Series progress: %d/%d",
-                completed,
-                total_series,
+                "Series progress: %d/%d processed, %d written, %d failed",
+                processed, total, written, failed
             )
 
-            del futures
-            del batch
+        if processed % pause_every == 0 and pause_seconds > 0:
+            LOGGER.info("Series throttle pause: %.1fs", pause_seconds)
+            time.sleep(pause_seconds)
+            gc.collect()
 
-    written = write_series_cache_streaming(
-        result_iterator(),
-        priority,
-    )
+        # Drop references before the next provider request.
+        result = None
+        gc.collect()
 
-    if not written:
-        raise RuntimeError("no_series_details")
+    with temp_path.open("a", encoding="utf-8") as fh:
+        fh.write("]}")
+        fh.flush()
+        os.fsync(fh.fileno())
 
-    LOGGER.info(
-        "Series cache written: %d item(s)",
-        written,
-    )
+    os.replace(temp_path, CACHE_FILES["series"])
+
+    try:
+        checkpoint_path.unlink()
+    except FileNotFoundError:
+        pass
 
     update_series_state_from_cache()
-
     LOGGER.info(
-        "Series state updated: %d item(s)",
-        written,
+        "Series cache written: %d item(s), %d failed",
+        written, failed
     )
-
-    return written
-
-
-# ============================================================================
-# CACHE REFRESH
-# ============================================================================
 
 def refresh_cache_type(cache_type):
     if cache_type == "tv":
