@@ -18,7 +18,7 @@ from xml.etree import ElementTree
 
 
 APP_NAME = "StreamHub"
-APP_VERSION = "2.0.4"
+APP_VERSION = "2.0.6"
 
 HOST = "0.0.0.0"
 PORT = 8088
@@ -60,9 +60,11 @@ DEFAULT_CONFIG = {
 
     "series_workers": 1,
     "series_request_delay": 1.5,
+ "cache_refresh_on_start": false,
  "series_checkpoint_every": 100,
  "series_pause_every": 500,
  "series_pause_seconds": 2.0,
+ "series_state_rebuild_on_start": False,
 
     "epg_enabled": True,
     "epg_url": "",
@@ -2743,15 +2745,8 @@ def fetch_series_detail(
 
 
 def build_series_cache(server, priority):
-    """
-    Build the Series cache conservatively.
-
-    2.0.4 deliberately processes one Series at a time. Results are written
-    incrementally to disk so a large provider catalogue does not accumulate
-    thousands of detailed Series objects in RAM. Progress is checkpointed so
-    an interrupted build can be resumed safely.
-    """
-    LOGGER.info("Building series cache using P%d (conservative mode)", priority)
+    """Build Series cache with bounded concurrency, checkpoints and streaming writes."""
+    LOGGER.info("Building series cache using P%d", priority)
 
     categories = get_series_categories(server)
     if categories is None:
@@ -2763,7 +2758,6 @@ def build_series_cache(server, priority):
 
     filtered = []
     seen = set()
-
     for series in series_items:
         if not item_matches_content(series):
             continue
@@ -2775,29 +2769,29 @@ def build_series_cache(server, priority):
         filtered.append(normalized)
 
     total = len(filtered)
-    LOGGER.info("Series catalogue after filtering/deduplication: %d item(s)", total)
-
-    workers = 1
+    workers = max(1, min(4, int(CONFIG.get("series_workers", 1))))
     delay = max(0.0, float(CONFIG.get("series_request_delay", 1.5)))
     checkpoint_every = max(1, int(CONFIG.get("series_checkpoint_every", 100)))
     pause_every = max(checkpoint_every, int(CONFIG.get("series_pause_every", 500)))
     pause_seconds = max(0.0, float(CONFIG.get("series_pause_seconds", 2.0)))
 
-    # Persistent build state. This is intentionally small: only the index,
-    # counters and completed IDs are retained, never the full Series payload.
+    LOGGER.info(
+        "Series catalogue: %d item(s), workers=%d, delay=%.2fs",
+        total, workers, delay
+    )
+
+    # Keep the existing 2.0.3 checkpoint/cache approach, but bound the
+    # submitted work so the number of in-flight futures stays small.
     checkpoint_path = BASE_DIR / "series_build_checkpoint.json"
     checkpoint = load_json(checkpoint_path, default={}) or {}
     completed_ids = set(checkpoint.get("completed_ids", []))
 
+    processed = int(checkpoint.get("processed", 0))
+    written = int(checkpoint.get("written", 0))
+    failed = int(checkpoint.get("failed", 0))
+
     temp_path = CACHE_FILES["series"].with_suffix(".json.partial")
-    existing_items = []
 
-    # Reuse a previously written partial cache if present. We only keep the
-    # partial file on disk; no full Series catalogue is loaded into RAM.
-    if temp_path.exists():
-        LOGGER.info("Resuming Series build from partial cache: %s", temp_path)
-
-    # Start a fresh partial JSON array if needed.
     if not temp_path.exists():
         with temp_path.open("w", encoding="utf-8") as fh:
             fh.write('{"updated_at":')
@@ -2806,8 +2800,6 @@ def build_series_cache(server, priority):
             json.dump(priority, fh)
             fh.write(',"items":[')
 
-    # Determine whether the partial file already contains objects by checking
-    # the tail only. This avoids loading the file into RAM.
     has_items = False
     try:
         with temp_path.open("rb") as fh:
@@ -2818,75 +2810,86 @@ def build_series_cache(server, priority):
                 tail = fh.read().decode("utf-8", errors="ignore").rstrip()
                 has_items = not tail.endswith("[")
     except OSError:
-        has_items = False
+        pass
 
-    processed = int(checkpoint.get("processed", 0))
-    written = int(checkpoint.get("written", 0))
-    failed = int(checkpoint.get("failed", 0))
+    # Process bounded batches. Workers remains configurable; default is 1.
+    batch_size = max(workers, min(20, workers * 5))
 
-    if processed > total:
-        processed = 0
-        written = 0
-        failed = 0
-        completed_ids.clear()
+    for batch_start in range(0, total, batch_size):
+        batch = []
+        for series in filtered[batch_start:batch_start + batch_size]:
+            item_id = streamhub_id("series", series)
+            if item_id not in completed_ids:
+                batch.append((item_id, series))
 
-    for index, series in enumerate(filtered):
-        item_id = streamhub_id("series", series)
-
-        if item_id in completed_ids:
+        if not batch:
             continue
 
-        item_number = index + 1
-        LOGGER.info("Series item %d/%d: %s", item_number, total,
-                    str(series.get("name") or series.get("title") or item_id)[:180])
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {
+                executor.submit(
+                    fetch_series_detail, server, priority, series, delay
+                ): (item_id, series)
+                for item_id, series in batch
+            }
 
-        result = None
-        try:
-            result = fetch_series_detail(server, priority, series, delay)
-        except Exception as exc:
-            failed += 1
-            LOGGER.warning("Series item %d failed: %s", item_number, exc)
+            for future in as_completed(future_map):
+                item_id, series = future_map[future]
+                item_number = batch_start + batch.index((item_id, series)) + 1
 
-        if result:
-            payload = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
-            with temp_path.open("a", encoding="utf-8") as fh:
-                if has_items:
-                    fh.write(",")
-                fh.write(payload)
-                fh.flush()
-                os.fsync(fh.fileno())
-            has_items = True
-            written += 1
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    failed += 1
+                    LOGGER.warning(
+                        "Series item %d/%d failed (%s): %s",
+                        item_number, total, item_id, exc
+                    )
+                    result = None
 
-        completed_ids.add(item_id)
-        processed += 1
+                if result:
+                    payload = json.dumps(
+                        result, ensure_ascii=False, separators=(",", ":")
+                    )
+                    with temp_path.open("a", encoding="utf-8") as fh:
+                        if has_items:
+                            fh.write(",")
+                        fh.write(payload)
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    has_items = True
+                    written += 1
 
-        if processed % checkpoint_every == 0 or processed == total:
-            atomic_write_json(
-                checkpoint_path,
-                {
-                    "version": 1,
-                    "provider_priority": priority,
-                    "total": total,
-                    "processed": processed,
-                    "written": written,
-                    "failed": failed,
-                    "completed_ids": list(completed_ids),
-                    "updated_at": now_iso(),
-                },
-            )
-            LOGGER.info(
-                "Series progress: %d/%d processed, %d written, %d failed",
-                processed, total, written, failed
-            )
+                completed_ids.add(item_id)
+                processed += 1
+                result = None
 
-        if processed % pause_every == 0 and pause_seconds > 0:
-            LOGGER.info("Series throttle pause: %.1fs", pause_seconds)
-            time.sleep(pause_seconds)
-            gc.collect()
+                if processed % checkpoint_every == 0 or processed == total:
+                    atomic_write_json(
+                        checkpoint_path,
+                        {
+                            "version": 1,
+                            "provider_priority": priority,
+                            "total": total,
+                            "processed": processed,
+                            "written": written,
+                            "failed": failed,
+                            "completed_ids": list(completed_ids),
+                            "updated_at": now_iso(),
+                        },
+                    )
+                    LOGGER.info(
+                        "Series progress: %d/%d processed, %d written, %d failed",
+                        processed, total, written, failed
+                    )
 
-        # Drop references before the next provider request.
-        result = None
+                if processed % pause_every == 0 and pause_seconds > 0:
+                    LOGGER.info(
+                        "Series throttle pause: %.1fs", pause_seconds
+                    )
+                    time.sleep(pause_seconds)
+                    gc.collect()
+
         gc.collect()
 
     with temp_path.open("a", encoding="utf-8") as fh:
@@ -2901,10 +2904,13 @@ def build_series_cache(server, priority):
     except FileNotFoundError:
         pass
 
-    update_series_state_from_cache()
     LOGGER.info(
         "Series cache written: %d item(s), %d failed",
         written, failed
+    )
+    LOGGER.info(
+        "Series state rebuild skipped after cache refresh; "
+        "existing state preserved"
     )
 
 def refresh_cache_type(cache_type):
@@ -5305,7 +5311,7 @@ class StreamHubHandler(
 # ============================================================================
 
 def startup_background_worker():
-    """Perform provider/state/cache initialization after HTTP is available."""
+    """Initialize providers and reuse persistent caches on startup."""
     LOGGER.info("Background initialization started")
 
     try:
@@ -5317,14 +5323,24 @@ def startup_background_worker():
             type(exc).__name__,
         )
 
-    try:
-        if CACHE_FILES["series"].exists():
-            LOGGER.info("Rebuilding Series state from existing cache")
-            update_series_state_from_cache()
-    except Exception as exc:
-        LOGGER.warning(
-            "Unable to initialize series state: %s",
-            type(exc).__name__,
+    # Never rebuild complete Series state automatically unless explicitly enabled.
+    if CONFIG.get("series_state_rebuild_on_start", False):
+        try:
+            if CACHE_FILES["series"].exists():
+                LOGGER.info(
+                    "Series state rebuild explicitly enabled; "
+                    "processing existing cache"
+                )
+                update_series_state_from_cache()
+        except Exception as exc:
+            LOGGER.warning(
+                "Unable to initialize series state: %s",
+                type(exc).__name__,
+            )
+    else:
+        LOGGER.info(
+            "Skipping full Series state rebuild at startup "
+            "(series_state_rebuild_on_start=false)"
         )
 
     try:
@@ -5335,14 +5351,51 @@ def startup_background_worker():
             type(exc).__name__,
         )
 
-    LOGGER.info("Starting background cache refresh")
-    try:
-        refresh_all_caches()
-    except Exception as exc:
-        LOGGER.error(
-            "Background cache prewarm failed: %s",
-            type(exc).__name__,
+    # TV, Movies and Series are persistent caches. On normal startup we reuse
+    # them instead of downloading the entire catalogue again. A missing cache
+    # is still built automatically. Full refresh remains available through the
+    # existing manual refresh endpoint.
+    if CONFIG.get("cache_refresh_on_start", False):
+        LOGGER.info(
+            "Full cache refresh explicitly enabled at startup"
         )
+        try:
+            refresh_all_caches()
+        except Exception as exc:
+            LOGGER.error(
+                "Background cache refresh failed: %s",
+                type(exc).__name__,
+            )
+        return
+
+    LOGGER.info(
+        "Startup cache policy: reuse existing TV/Movies/Series caches"
+    )
+
+    for cache_type in ("tv", "movies", "series"):
+        cache_path = CACHE_FILES[cache_type]
+
+        if cache_path.exists():
+            LOGGER.info(
+                "Using existing %s cache: %s",
+                cache_type,
+                cache_path,
+            )
+            continue
+
+        LOGGER.info(
+            "No existing %s cache found; building it now",
+            cache_type,
+        )
+
+        try:
+            refresh_cache_type(cache_type)
+        except Exception as exc:
+            LOGGER.error(
+                "Initial %s cache build failed: %s",
+                cache_type,
+                type(exc).__name__,
+            )
 
 
 def start_server():
