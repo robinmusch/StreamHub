@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import gzip
 import hashlib
 import json
 import logging
@@ -12,10 +13,11 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlparse
 from urllib.request import Request, urlopen
+from xml.etree import ElementTree
 
 
 APP_NAME = "StreamHub"
-APP_VERSION = "1.4.0"
+APP_VERSION = "2.0.0"
 
 HOST = "0.0.0.0"
 PORT = 8088
@@ -24,6 +26,8 @@ OPTIONS_FILE = Path("/data/options.json")
 CACHE_DIR = Path("/data/cache")
 SERIES_STATE_FILE = Path("/data/series_state.json")
 PROVIDER_STATE_FILE = Path("/data/provider_state.json")
+SOURCE_RESOLUTION_FILE = Path("/data/source_resolution.json")
+EPG_CACHE_FILE = CACHE_DIR / "epg.xml"
 
 CACHE_FILES = {
     "tv": CACHE_DIR / "tv.json",
@@ -58,6 +62,8 @@ DEFAULT_CONFIG = {
 
     "epg_enabled": True,
     "epg_url": "",
+    "epg_cache_hours": 6,
+    "epg_timeout_seconds": 30,
 }
 
 
@@ -398,6 +404,8 @@ CACHE_LOCK = threading.Lock()
 SOURCE_RESOLUTION_LOCK = threading.Lock()
 SOURCE_RESOLUTION_CACHE = {}
 SOURCE_RESOLUTION_TTL_SECONDS = 900
+
+EPG_LOCK = threading.Lock()
 
 STATE = {
     "started": False,
@@ -1981,9 +1989,11 @@ def check_active_server():
 
 
 def health_loop():
+    elapsed_since_full = 0
     while True:
         try:
             check_all_servers()
+            elapsed_since_full = 0
 
         except Exception as exc:
             LOGGER.error(
@@ -1991,17 +2001,272 @@ def health_loop():
                 exc,
             )
 
-        time.sleep(
-            max(
-                60,
-                safe_int(
-                    CONFIG.get(
-                        "health_check_seconds"
-                    ),
-                    900,
-                ),
-            )
+        interval = max(
+            60,
+            safe_int(
+                CONFIG.get("health_check_seconds"),
+                900,
+            ),
         )
+        backup_interval = max(
+            interval,
+            safe_int(
+                CONFIG.get("backup_health_check_seconds"),
+                21600,
+            ),
+        )
+
+        # Full provider checks already run on the active interval.
+        # The backup interval remains a configurable recovery horizon.
+        time.sleep(interval)
+        elapsed_since_full += interval
+
+
+
+# ============================================================================
+# EPG ENGINE
+# ============================================================================
+
+def epg_cache_ttl_seconds():
+    return max(
+        0,
+        safe_int(
+            CONFIG.get("epg_cache_hours", 6),
+            6,
+        ),
+    ) * 3600
+
+
+def epg_timeout_seconds():
+    return max(
+        5,
+        safe_int(
+            CONFIG.get("epg_timeout_seconds", 30),
+            30,
+        ),
+    )
+
+
+def epg_source_url():
+    return str(
+        CONFIG.get("epg_url", "") or ""
+    ).strip()
+
+
+def read_epg_cache():
+    try:
+        if not EPG_CACHE_FILE.exists():
+            return None
+        return EPG_CACHE_FILE.read_bytes()
+    except Exception as exc:
+        LOGGER.warning("Unable to read EPG cache: %s", type(exc).__name__)
+        return None
+
+
+def epg_cache_is_fresh():
+    try:
+        if not EPG_CACHE_FILE.exists():
+            return False
+        ttl = epg_cache_ttl_seconds()
+        if ttl <= 0:
+            return False
+        return (time.time() - EPG_CACHE_FILE.stat().st_mtime) <= ttl
+    except Exception:
+        return False
+
+
+def save_epg_cache(data):
+    if not data:
+        return False
+    tmp = EPG_CACHE_FILE.with_suffix(".tmp")
+    try:
+        with EPG_LOCK:
+            tmp.write_bytes(data)
+            os.replace(tmp, EPG_CACHE_FILE)
+        return True
+    except Exception as exc:
+        LOGGER.warning("Unable to save EPG cache: %s", type(exc).__name__)
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False
+
+
+def fetch_epg_xml():
+    url = epg_source_url()
+    if not url:
+        return None
+
+    request = Request(
+        url,
+        headers={
+            "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+            "Accept": "application/xml,text/xml,application/gzip,*/*",
+            "Accept-Encoding": "gzip",
+        },
+        method="GET",
+    )
+
+    with urlopen(request, timeout=epg_timeout_seconds()) as response:
+        body = response.read()
+
+    if body[:2] == b"\x1f\x8b":
+        body = gzip.decompress(body)
+
+    # Validate XML before putting it into persistent cache.
+    ElementTree.fromstring(body)
+    return body
+
+
+def ensure_epg_cache(force=False):
+    if not bool(CONFIG.get("epg_enabled", True)):
+        return read_epg_cache(), "disabled"
+
+    if not force and epg_cache_is_fresh():
+        return read_epg_cache(), "cache"
+
+    try:
+        body = fetch_epg_xml()
+        if body and save_epg_cache(body):
+            return body, "refresh"
+    except Exception as exc:
+        LOGGER.warning("EPG refresh failed: %s", type(exc).__name__)
+
+    cached = read_epg_cache()
+    if cached:
+        return cached, "stale-cache"
+
+    return None, "unavailable"
+
+
+def xml_text(element):
+    if element is None:
+        return ""
+    return "".join(element.itertext()).strip()
+
+
+def epg_programmes(xml_bytes):
+    if not xml_bytes:
+        return []
+    try:
+        root = ElementTree.fromstring(xml_bytes)
+    except Exception:
+        return []
+
+    programmes = []
+    for programme in root.iter():
+        if not programme.tag.lower().endswith("programme"):
+            continue
+
+        channel = str(programme.attrib.get("channel", "") or "")
+        start = str(programme.attrib.get("start", "") or "")
+        stop = str(programme.attrib.get("stop", "") or "")
+
+        title = ""
+        desc = ""
+        for child in list(programme):
+            name = child.tag.rsplit("}", 1)[-1].lower()
+            if name == "title" and not title:
+                title = xml_text(child)
+            elif name == "desc" and not desc:
+                desc = xml_text(child)
+
+        programmes.append({
+            "channel": channel,
+            "start": start,
+            "stop": stop,
+            "title": title,
+            "description": desc,
+        })
+
+    return programmes
+
+
+def stream_epg_channel(item):
+    value = (
+        item.get("epg_channel_id")
+        or item.get("epg_id")
+        or item.get("epg_channel")
+        or ""
+    )
+    return str(value).strip()
+
+
+def xtream_epg_listings(channel_id="", limit=20):
+    body, _ = ensure_epg_cache()
+    if not body:
+        return []
+
+    channel_id = str(channel_id or "").strip()
+    results = []
+
+    for item in epg_programmes(body):
+        if channel_id and item["channel"] != channel_id:
+            continue
+        results.append({
+            "id": item["channel"],
+            "epg_id": item["channel"],
+            "title": item["title"],
+            "description": item["description"],
+            "start": item["start"],
+            "end": item["stop"],
+            "start_timestamp": 0,
+            "stop_timestamp": 0,
+            "lang": "nl",
+        })
+        if len(results) >= max(1, limit):
+            break
+
+    return results
+
+
+# ============================================================================
+# PERSISTENT STREAM SOURCE CACHE
+# ============================================================================
+
+def load_source_resolution_cache():
+    payload = read_json_file(SOURCE_RESOLUTION_FILE)
+    if not isinstance(payload, dict):
+        return
+
+    now = time.time()
+    restored = {}
+    for key, value in payload.items():
+        if not isinstance(value, dict):
+            continue
+        created = safe_float(value.get("created_at"), 0)
+        if created <= 0 or now - created > SOURCE_RESOLUTION_TTL_SECONDS:
+            continue
+        source = value.get("source")
+        if isinstance(source, dict) and source.get("stream_id"):
+            restored[key] = {
+                "created_at": created,
+                "source": source,
+            }
+
+    with SOURCE_RESOLUTION_LOCK:
+        SOURCE_RESOLUTION_CACHE.update(restored)
+
+
+def save_source_resolution_cache():
+    now = time.time()
+    with SOURCE_RESOLUTION_LOCK:
+        payload = {
+            str(key): value
+            for key, value in SOURCE_RESOLUTION_CACHE.items()
+            if isinstance(value, dict)
+            and now - safe_float(value.get("created_at"), 0) <= SOURCE_RESOLUTION_TTL_SECONDS
+        }
+
+    try:
+        atomic_write_json(SOURCE_RESOLUTION_FILE, payload)
+    except Exception as exc:
+        LOGGER.warning("Unable to persist source cache: %s", type(exc).__name__)
+
+
+def source_cache_key(cache_type, item_id, priority):
+    return f"{cache_type}|{item_id}|{priority}"
 
 
 # ============================================================================
@@ -2585,6 +2850,11 @@ def refresh_all_caches():
 
 
 def prewarm_thread():
+    try:
+        ensure_epg_cache()
+    except Exception as exc:
+        LOGGER.warning("EPG prewarm failed: %s", type(exc).__name__)
+
     time.sleep(2)
 
     try:
@@ -3521,12 +3791,20 @@ def player_api_response(
         }
 
     if action == "get_short_epg":
+        stream_id = query.get("stream_id", [""])[0]
+        limit = safe_int(query.get("limit", ["20"])[0], 20)
+        item = find_cached_item("tv", stream_id) if stream_id else None
+        channel_id = stream_epg_channel(item) if item else ""
         return {
-            "epg_listings": []
+            "epg_listings": xtream_epg_listings(channel_id, limit)
         }
 
     if action == "get_simple_data_table":
-        return []
+        stream_id = query.get("stream_id", [""])[0]
+        limit = safe_int(query.get("limit", ["20"])[0], 20)
+        item = find_cached_item("tv", stream_id) if stream_id else None
+        channel_id = stream_epg_channel(item) if item else ""
+        return xtream_epg_listings(channel_id, limit)
 
     return {
         "error": "unsupported_action",
@@ -3738,7 +4016,7 @@ def resolve_stream_source(cache_type, item, server, priority):
         if cache_type == "series"
         else streamhub_id(cache_type, item)
     )
-    cache_key = (cache_type, item_id, priority)
+    cache_key = source_cache_key(cache_type, item_id, priority)
     now = time.time()
 
     with SOURCE_RESOLUTION_LOCK:
@@ -3828,6 +4106,7 @@ def resolve_stream_source(cache_type, item, server, priority):
             "source": source,
         }
 
+    save_source_resolution_cache()
     return source
 
 
@@ -4220,27 +4499,29 @@ class StreamHubHandler(
         )
 
     def do_HEAD(self):
-        parsed = urlparse(
-            self.path
-        )
+        parsed = urlparse(self.path)
+        path = parsed.path
 
-        if parsed.path == "/health":
-            self.send_response(
-                200
-            )
-
-            self.send_header(
-                "Content-Type",
-                "application/json; charset=utf-8",
-            )
-
+        if path == "/health":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", "0")
             self.end_headers()
             return
 
-        self.send_response(
-            404
-        )
-        self.end_headers()
+        if path.startswith(("/live/", "/movie/", "/series/")):
+            self.send_response(405)
+            self.send_header("Allow", "GET")
+            self.end_headers()
+            return
+
+        # Reuse GET routing for metadata/M3U/EPG while suppressing the body.
+        original_command = self.command
+        try:
+            self.command = "HEAD"
+            self.do_GET()
+        finally:
+            self.command = original_command
 
     def do_GET(self):
         parsed = urlparse(
@@ -4398,6 +4679,17 @@ class StreamHubHandler(
                         ),
                         "series": cache_status(
                             "series"
+                        ),
+                    },
+                    "epg": {
+                        "enabled": bool(CONFIG.get("epg_enabled", True)),
+                        "configured": bool(epg_source_url()),
+                        "cache_fresh": epg_cache_is_fresh(),
+                        "cache_exists": EPG_CACHE_FILE.exists(),
+                        "cache_age_seconds": (
+                            round(time.time() - EPG_CACHE_FILE.stat().st_mtime, 1)
+                            if EPG_CACHE_FILE.exists()
+                            else None
                         ),
                     },
                     "series_state": {
@@ -4582,6 +4874,34 @@ class StreamHubHandler(
                     ),
                 },
             )
+            return
+
+        # ------------------------------------------------------------
+        # EPG
+        # ------------------------------------------------------------
+
+        if path == "/epg.xml":
+            body, source = ensure_epg_cache()
+            if not body:
+                send_json(
+                    self,
+                    503,
+                    {
+                        "status": "error",
+                        "error": "epg_unavailable",
+                    },
+                )
+                return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/xml; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "public, max-age=300")
+            self.send_header("X-StreamHub-EPG-Source", source)
+            self.end_headers()
+
+            if self.command != "HEAD":
+                self.wfile.write(body)
             return
 
         # ------------------------------------------------------------
@@ -4857,6 +5177,8 @@ def start_server():
                 0,
             ),
         )
+
+    load_source_resolution_cache()
 
     LOGGER.info(
         "%s %s starting on %s:%d",
