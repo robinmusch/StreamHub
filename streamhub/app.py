@@ -527,6 +527,11 @@ def iter_json_array_items(path):
         while True:
             buffer = buffer.lstrip()
 
+            # JSON array items are comma-separated. Consume the delimiter
+            # before decoding the next object.
+            if buffer.startswith(","):
+                buffer = buffer[1:].lstrip()
+
             if buffer.startswith("]"):
                 return
 
@@ -821,8 +826,14 @@ def update_series_state_from_cache():
     )
 
     current_series_keys = set()
+    processed = 0
+
+    LOGGER.info("Rebuilding Series state from persistent cache")
 
     for series_item in series_items:
+        processed += 1
+        if processed % 250 == 0:
+            LOGGER.info("Series state: %d item(s) processed", processed)
         if not isinstance(
             series_item,
             dict,
@@ -989,6 +1000,8 @@ def update_series_state_from_cache():
     save_series_state(
         state
     )
+
+    LOGGER.info("Series state rebuilt: %d item(s)", processed)
 
     return state
 
@@ -5295,10 +5308,50 @@ class StreamHubHandler(
 # STARTUP
 # ============================================================================
 
+def startup_background_worker():
+    """Perform provider/state/cache initialization after HTTP is available."""
+    LOGGER.info("Background initialization started")
+
+    try:
+        LOGGER.info("Starting provider health checks")
+        check_all_servers()
+    except Exception as exc:
+        LOGGER.error(
+            "Provider health initialization failed: %s",
+            type(exc).__name__,
+        )
+
+    try:
+        if CACHE_FILES["series"].exists():
+            LOGGER.info("Rebuilding Series state from existing cache")
+            update_series_state_from_cache()
+    except Exception as exc:
+        LOGGER.warning(
+            "Unable to initialize series state: %s",
+            type(exc).__name__,
+        )
+
+    try:
+        ensure_epg_cache()
+    except Exception as exc:
+        LOGGER.warning(
+            "EPG prewarm failed: %s",
+            type(exc).__name__,
+        )
+
+    LOGGER.info("Starting background cache refresh")
+    try:
+        refresh_all_caches()
+    except Exception as exc:
+        LOGGER.error(
+            "Background cache prewarm failed: %s",
+            type(exc).__name__,
+        )
+
+
 def start_server():
     ensure_directories()
 
-    # Zorg dat de state meteen bestaat.
     if not SERIES_STATE_FILE.exists():
         save_series_state(
             default_series_state()
@@ -5352,34 +5405,8 @@ def start_server():
         filter_info["mode"],
     )
 
-    check_all_servers()
-
-    # Bestaande series-cache opnieuw koppelen aan state.
-    try:
-        if CACHE_FILES["series"].exists():
-            update_series_state_from_cache()
-    except Exception as exc:
-        LOGGER.warning(
-            "Unable to initialize series state: %s",
-            type(exc).__name__,
-        )
-
-    prewarm = threading.Thread(
-        target=prewarm_thread,
-        name="streamhub-cache-prewarm",
-        daemon=True,
-    )
-
-    prewarm.start()
-
-    health_thread = threading.Thread(
-        target=health_loop,
-        name="streamhub-health",
-        daemon=True,
-    )
-
-    health_thread.start()
-
+    # Bind the HTTP server BEFORE any provider/cache/Series work.
+    # This keeps /health and /status available during long operations.
     http_server = ThreadingHTTPServer(
         (
             HOST,
@@ -5391,6 +5418,32 @@ def start_server():
     STATE[
         "started"
     ] = True
+
+    LOGGER.info(
+        "HTTP server listening on %s:%d",
+        HOST,
+        PORT,
+    )
+
+    LOGGER.info(
+        "Health endpoint available at /health"
+    )
+
+    startup_thread = threading.Thread(
+        target=startup_background_worker,
+        name="streamhub-startup-background",
+        daemon=True,
+    )
+
+    startup_thread.start()
+
+    health_thread = threading.Thread(
+        target=health_loop,
+        name="streamhub-health",
+        daemon=True,
+    )
+
+    health_thread.start()
 
     try:
         http_server.serve_forever()
