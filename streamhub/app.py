@@ -17,7 +17,7 @@ from xml.etree import ElementTree
 
 
 APP_NAME = "StreamHub"
-APP_VERSION = "2.0.2"
+APP_VERSION = "2.0.3"
 
 HOST = "0.0.0.0"
 PORT = 8088
