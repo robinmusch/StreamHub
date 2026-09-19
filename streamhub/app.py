@@ -18,7 +18,7 @@ from xml.etree import ElementTree
 
 
 APP_NAME = "StreamHub"
-APP_VERSION = "2.0.6"
+APP_VERSION = "2.0.7"
 
 HOST = "0.0.0.0"
 PORT = 8088
@@ -60,7 +60,7 @@ DEFAULT_CONFIG = {
 
     "series_workers": 1,
     "series_request_delay": 1.5,
- "cache_refresh_on_start": false,
+ "cache_refresh_on_start": False,
  "series_checkpoint_every": 100,
  "series_pause_every": 500,
  "series_pause_seconds": 2.0,
