@@ -1,7 +1,6 @@
 FROM python:3.12-slim
 
 LABEL \
-    io.hass.version="2.0.7" \
     io.hass.type="app" \
     io.hass.arch="aarch64|amd64"
 
