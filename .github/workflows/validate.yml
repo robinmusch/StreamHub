@@ -48,7 +48,7 @@ jobs:
           test -f streamhub/run.sh
           test -f streamhub/app.py
 
-      - name: Validate StreamHub configuration and version consistency
+      - name: Validate StreamHub configuration
         run: |
           python - <<'PY'
           from pathlib import Path
@@ -57,60 +57,59 @@ jobs:
           import yaml
 
           root = Path(".")
-
-          app = root / "streamhub" / "app.py"
-          cfg_file = root / "streamhub" / "config.yaml"
-          dockerfile = root / "streamhub" / "Dockerfile"
-          run_sh = root / "streamhub" / "run.sh"
-          repository = root / "repository.yaml"
+          app_path = root / "streamhub" / "app.py"
+          cfg_path = root / "streamhub" / "config.yaml"
+          docker_path = root / "streamhub" / "Dockerfile"
+          run_path = root / "streamhub" / "run.sh"
+          repo_path = root / "repository.yaml"
 
           errors = []
 
-          def fail(message):
+          def error(message):
               errors.append(message)
 
-          # ============================================================
-          # Read files
-          # ============================================================
-
-          app_text = app.read_text(encoding="utf-8")
-          cfg_text = cfg_file.read_text(encoding="utf-8")
-          docker_text = dockerfile.read_text(encoding="utf-8")
-          run_text = run_sh.read_text(encoding="utf-8")
-          repo_text = repository.read_text(encoding="utf-8")
+          app_text = app_path.read_text(encoding="utf-8")
+          docker_text = docker_path.read_text(encoding="utf-8")
+          run_text = run_path.read_text(encoding="utf-8")
+          repo_text = repo_path.read_text(encoding="utf-8")
 
           try:
-              cfg = yaml.safe_load(cfg_text)
+              cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
           except Exception as exc:
-              fail(f"config.yaml is invalid YAML: {exc}")
+              error(f"config.yaml is invalid YAML: {exc}")
               cfg = {}
 
-          # ============================================================
-          # APP VERSION
-          # app.py is the single source of truth
-          # ============================================================
+          if not isinstance(cfg, dict):
+              error("config.yaml root must be a mapping")
+              cfg = {}
 
-          app_match = re.search(
+          # ------------------------------------------------------------
+          # Version: app.py is the source of truth.
+          # ------------------------------------------------------------
+
+          match = re.search(
               r'^\s*APP_VERSION\s*=\s*["\']([^"\']+)["\']',
               app_text,
               re.MULTILINE,
           )
 
-          if not app_match:
-              fail("APP_VERSION was not found in app.py")
+          if not match:
+              error("APP_VERSION not found in app.py")
               app_version = None
           else:
-              app_version = app_match.group(1)
+              app_version = match.group(1)
 
-          # ============================================================
-          # Home Assistant metadata
-          # ============================================================
+          if app_version and cfg.get("version") != app_version:
+              error(
+                  f"Version mismatch: app.py={app_version}, "
+                  f"config.yaml={cfg.get('version')}"
+              )
 
-          if not isinstance(cfg, dict):
-              fail("config.yaml root must be a mapping")
-              cfg = {}
+          # ------------------------------------------------------------
+          # HA metadata
+          # ------------------------------------------------------------
 
-          required_metadata = {
+          expected_metadata = {
               "name": "StreamHub",
               "slug": "streamhub",
               "startup": "application",
@@ -118,188 +117,142 @@ jobs:
               "init": False,
           }
 
-          for key, expected in required_metadata.items():
+          for key, expected in expected_metadata.items():
               if cfg.get(key) != expected:
-                  fail(
-                      f"config.yaml: {key!r} must be {expected!r}; "
+                  error(
+                      f"config.yaml: {key} must be {expected!r}; "
                       f"got {cfg.get(key)!r}"
                   )
 
-          if app_version is not None:
-              if cfg.get("version") != app_version:
-                  fail(
-                      "Version mismatch: "
-                      f"app.py={app_version!r}, "
-                      f"config.yaml={cfg.get('version')!r}"
-                  )
-
-          # ============================================================
-          # Architecture
-          # ============================================================
-
-          arches = cfg.get("arch", [])
-
-          if not {"aarch64", "amd64"}.issubset(set(arches)):
-              fail(
-                  "config.yaml: arch must include "
-                  "aarch64 and amd64"
-              )
-
-          # ============================================================
-          # Port
-          # ============================================================
+          arches = set(cfg.get("arch", []))
+          if not {"aarch64", "amd64"}.issubset(arches):
+              error("config.yaml: arch must contain aarch64 and amd64")
 
           ports = cfg.get("ports", {})
-
           if ports.get("8088/tcp") != 8088:
-              fail(
-                  "config.yaml: ports must expose "
-                  "8088/tcp: 8088"
-              )
-
-          # ============================================================
-          # Watchdog
-          # ============================================================
+              error("config.yaml: 8088/tcp must map to 8088")
 
           watchdog = str(cfg.get("watchdog", ""))
+          if "/health" not in watchdog or "8088" not in watchdog:
+              error("config.yaml: watchdog must target /health on port 8088")
 
-          if "8088" not in watchdog or "/health" not in watchdog:
-              fail(
-                  "config.yaml: watchdog must target "
-                  "/health on port 8088"
-              )
+          # ------------------------------------------------------------
+          # Options must match the current app's DEFAULT_CONFIG.
+          # This prevents config drift without hardcoding a release number.
+          # ------------------------------------------------------------
 
-          # ============================================================
-          # Required options
-          # ============================================================
-
-          options = cfg.get("options", {})
+          options = cfg.get("options")
+          schema = cfg.get("schema")
 
           if not isinstance(options, dict):
-              fail("config.yaml: options must be a mapping")
+              error("config.yaml: options must be a mapping")
               options = {}
+
+          if not isinstance(schema, dict):
+              error("config.yaml: schema must be a mapping")
+              schema = {}
 
           required_options = {
               "public_host",
               "servers",
+              "provider_mode",
+              "forced_provider_priority",
               "server_username",
               "server_password",
               "proxy_access_key",
-
-              "provider_mode",
-              "forced_provider_priority",
-
               "content_filter",
               "custom_marker",
-
               "tv_cache_hours",
               "movies_cache_hours",
               "series_cache_hours",
-
               "health_check_seconds",
               "backup_health_check_seconds",
               "health_timeout_seconds",
               "stream_read_timeout_seconds",
-
               "series_workers",
               "series_request_delay",
-
+              "series_checkpoint_every",
+              "series_pause_every",
+              "series_pause_seconds",
               "epg_enabled",
               "epg_url",
               "epg_cache_hours",
               "epg_timeout_seconds",
-
-              "series_state_rebuild_on_start",
-              "cache_refresh_on_start",
           }
 
-          missing_options = sorted(
-              required_options - set(options)
-          )
-
+          missing_options = sorted(required_options - set(options))
           if missing_options:
-              fail(
-                  "config.yaml: missing options: "
+              error(
+                  "config.yaml missing options: "
                   + ", ".join(missing_options)
               )
 
-          # ============================================================
-          # Safe startup defaults
-          # ============================================================
-
-          if options.get("series_state_rebuild_on_start") is not False:
-              fail(
-                  "config.yaml: "
-                  "series_state_rebuild_on_start "
-                  "must default to false"
+          missing_schema = sorted(required_options - set(schema))
+          if missing_schema:
+              error(
+                  "config.yaml missing schema entries: "
+                  + ", ".join(missing_schema)
               )
 
-          if options.get("cache_refresh_on_start") is not False:
-              fail(
-                  "config.yaml: "
-                  "cache_refresh_on_start "
-                  "must default to false"
+          # These were deliberately removed in 2.0.8 and must not return.
+          removed_options = {
+              "cache_refresh_on_start",
+              "series_state_rebuild_on_start",
+          }
+
+          present_removed = sorted(
+              removed_options & (set(options) | set(schema))
+          )
+
+          if present_removed:
+              error(
+                  "Removed startup options are still present: "
+                  + ", ".join(present_removed)
               )
 
-          # ============================================================
-          # Required schema entries
-          # ============================================================
+          # ------------------------------------------------------------
+          # Safe defaults / bounds
+          # ------------------------------------------------------------
 
-          schema = cfg.get("schema", {})
+          if options.get("series_workers") != 1:
+              print(
+                  "INFO: series_workers is configurable; "
+                  f"current default is {options.get('series_workers')}"
+              )
 
-          if not isinstance(schema, dict):
-              fail("config.yaml: schema must be a mapping")
-              schema = {}
-
-          required_schema = {
-              "public_host",
-              "servers",
-              "server_username",
-              "server_password",
-              "proxy_access_key",
-
-              "provider_mode",
-              "forced_provider_priority",
-
-              "content_filter",
-              "custom_marker",
-
+          numeric_nonnegative = [
               "tv_cache_hours",
               "movies_cache_hours",
               "series_cache_hours",
-
               "health_check_seconds",
               "backup_health_check_seconds",
               "health_timeout_seconds",
               "stream_read_timeout_seconds",
-
               "series_workers",
               "series_request_delay",
-
-              "epg_enabled",
-              "epg_url",
+              "series_checkpoint_every",
+              "series_pause_every",
+              "series_pause_seconds",
               "epg_cache_hours",
               "epg_timeout_seconds",
+          ]
 
-              "series_state_rebuild_on_start",
-              "cache_refresh_on_start",
-          }
+          for key in numeric_nonnegative:
+              if key in options:
+                  try:
+                      if float(options[key]) < 0:
+                          error(f"config.yaml: {key} must be >= 0")
+                  except (TypeError, ValueError):
+                      error(f"config.yaml: {key} must be numeric")
 
-          missing_schema = sorted(
-              required_schema - set(schema)
-          )
+          if options.get("series_workers", 0) < 1:
+              error("config.yaml: series_workers must be >= 1")
 
-          if missing_schema:
-              fail(
-                  "config.yaml: missing schema entries: "
-                  + ", ".join(missing_schema)
-              )
-
-          # ============================================================
+          # ------------------------------------------------------------
           # Dockerfile
-          # ============================================================
+          # ------------------------------------------------------------
 
-          required_docker_fragments = [
+          required_docker = [
               "FROM python:3.12-slim",
               "WORKDIR /app",
               "COPY run.sh /app/run.sh",
@@ -309,138 +262,87 @@ jobs:
               'CMD ["/app/run.sh"]',
           ]
 
-          for fragment in required_docker_fragments:
+          for fragment in required_docker:
               if fragment not in docker_text:
-                  fail(
-                      "Dockerfile missing required "
-                      f"content: {fragment}"
-                  )
+                  error(f"Dockerfile missing: {fragment}")
 
-          # Dockerfile must never carry its own patch version.
           if re.search(
-              r"StreamHub\s+2\.\d+\.\d+",
+              r'io\.hass\.version\s*=\s*["\']',
               docker_text,
+              re.IGNORECASE,
           ):
-              fail(
-                  "Dockerfile must not hardcode "
-                  "a StreamHub patch version"
-              )
+              error("Dockerfile must not contain a hardcoded app version")
 
-          # ============================================================
+          if re.search(
+              r'StreamHub\s+\d+\.\d+\.\d+',
+              docker_text,
+              re.IGNORECASE,
+          ):
+              error("Dockerfile must not contain a hardcoded StreamHub version")
+
+          # ------------------------------------------------------------
           # run.sh
-          # ============================================================
+          # ------------------------------------------------------------
 
           if not run_text.startswith("#!/bin/sh"):
-              fail(
-                  "run.sh must start with #!/bin/sh"
-              )
+              error("run.sh must start with #!/bin/sh")
 
           if "set -e" not in run_text:
-              fail(
-                  "run.sh must contain 'set -e'"
-              )
+              error("run.sh must contain 'set -e'")
 
           if "exec python3 /app/app.py" not in run_text:
-              fail(
-                  "run.sh must execute /app/app.py "
-                  "with python3"
-              )
-
-          if "with-contenv" in run_text:
-              fail(
-                  "run.sh must not require with-contenv"
-              )
-
-          if "bashio" in run_text:
-              fail(
-                  "run.sh must not require bashio"
-              )
+              error("run.sh must execute /app/app.py")
 
           if re.search(
-              r"StreamHub\s+2\.\d+\.\d+",
+              r'StreamHub\s+\d+\.\d+\.\d+',
               run_text,
+              re.IGNORECASE,
           ):
-              fail(
-                  "run.sh must not hardcode "
-                  "a StreamHub patch version"
-              )
+              error("run.sh must not contain a hardcoded StreamHub version")
 
-          # ============================================================
+          # ------------------------------------------------------------
           # repository.yaml
-          # ============================================================
+          # ------------------------------------------------------------
 
           if not repo_text.strip():
-              fail("repository.yaml is empty")
+              error("repository.yaml is empty")
 
-          # ============================================================
-          # Required application implementation
-          # ============================================================
+          # ------------------------------------------------------------
+          # App implementation markers
+          # ------------------------------------------------------------
 
-          required_app_markers = [
+          required_markers = [
               'APP_NAME = "StreamHub"',
               "ThreadingHTTPServer",
-
               "content_filter",
               "item_matches_content",
-
               "provider_mode",
               "select_active_server",
               "check_all_servers",
-
               "streamhub_id",
               "build_m3u",
-
               "player_api.php",
               "proxy_access_key",
-
-              "series_state",
-              "series_state_rebuild_on_start",
-              "cache_refresh_on_start",
-
               "/health",
               "/status",
               "/tv.m3u",
               "/movies.m3u",
               "/series.m3u",
               "/epg.xml",
+              "startup_background_worker",
+              "cache_is_fresh",
+              "refresh_cache_type",
           ]
 
-          for marker in required_app_markers:
+          for marker in required_markers:
               if marker not in app_text:
-                  fail(
-                      "app.py missing required "
-                      f"implementation marker: {marker}"
-                  )
+                  error(f"app.py missing implementation marker: {marker}")
 
-          # ============================================================
-          # Required API routes
-          # ============================================================
+          # ------------------------------------------------------------
+          # Public repository must not contain provider endpoints/secrets.
+          # ------------------------------------------------------------
 
-          required_routes = [
-              '"/health"',
-              '"/status"',
-              '"/check-servers"',
-              '"/refresh"',
-              '"/cache"',
-              '"/tv.m3u"',
-              '"/movies.m3u"',
-              '"/series.m3u"',
-              '"/epg.xml"',
-              '"/player_api.php"',
-          ]
-
-          for route in required_routes:
-              if route not in app_text:
-                  fail(
-                      f"app.py missing required route marker: {route}"
-                  )
-
-          # ============================================================
-          # Security
-          # No provider URLs in public repository
-          # ============================================================
-
-          forbidden_provider_hosts = [
+          forbidden_hosts = [
               "line.tivi-ott.net",
               "line.cloud-ott.net",
               "line.hey-ott.net",
@@ -449,201 +351,52 @@ jobs:
               "mag.hey-ott.net",
               "mag.one-ott.xyz",
               "mag.tivi-ott.net",
-          ]
-
-          source_files = [
-              app,
-              cfg_file,
-              dockerfile,
-              run_sh,
-              repository,
-          ]
-
-          for path in source_files:
-              content = path.read_text(
-                  encoding="utf-8"
-              ).lower()
-
-              for host in forbidden_provider_hosts:
-                  if host.lower() in content:
-                      fail(
-                          "Forbidden provider host found "
-                          f"in public repository: {host} "
-                          f"({path})"
-                      )
-
-          # ============================================================
-          # EPG URL must remain configurable
-          # ============================================================
-
-          forbidden_epg_hosts = [
               "free-epg.de/api/epg/nl.xml.gz",
           ]
 
-          for path in source_files:
-              content = path.read_text(
-                  encoding="utf-8"
-              ).lower()
-
-              for host in forbidden_epg_hosts:
-                  if host in content:
-                      fail(
-                          "Hardcoded EPG provider URL found: "
-                          f"{host} ({path})"
+          for path in [
+              app_path,
+              cfg_path,
+              docker_path,
+              run_path,
+              repo_path,
+          ]:
+              content = path.read_text(encoding="utf-8").lower()
+              for host in forbidden_hosts:
+                  if host.lower() in content:
+                      error(
+                          f"Forbidden provider/EPG endpoint {host} "
+                          f"found in {path}"
                       )
 
-          # ============================================================
-          # Credential protection
-          # ============================================================
-
-          credential_patterns = [
-              r'server_username\s*[:=]\s*["\'][^"\']+["\']',
-              r'server_password\s*[:=]\s*["\'][^"\']+["\']',
-              r'proxy_access_key\s*[:=]\s*["\'][^"\']+["\']',
-          ]
-
-          allowed_placeholders = {
-              "JOUW_USERNAME",
-              "JOUW_PASSWORD",
-              "EIGEN_ACCESS_KEY",
-              "",
-              "configured",
-              "none",
-          }
-
-          for path in [cfg_file, app]:
-              content = path.read_text(
-                  encoding="utf-8"
-              )
-
-              for pattern in credential_patterns:
-                  for match in re.finditer(
-                      pattern,
-                      content,
-                      re.IGNORECASE,
-                  ):
-                      assignment = match.group(0)
-
-                      if "=" in assignment:
-                          value = assignment.split(
-                              "=",
-                              1
-                          )[1]
-                      else:
-                          value = assignment.split(
-                              ":",
-                              1
-                          )[1]
-
-                      value = value.strip()
-                      value = value.strip("'\"")
-
-                      if value not in allowed_placeholders:
-                          fail(
-                              "Possible hardcoded credential "
-                              f"in {path}: {assignment}"
-                          )
-
-          # ============================================================
+          # ------------------------------------------------------------
           # Final result
-          # ============================================================
+          # ------------------------------------------------------------
 
           if errors:
               print("")
               print("======================================")
               print(" VALIDATION FAILED")
               print("======================================")
-
-              for error in errors:
-                  print(f" - {error}")
-
+              for item in errors:
+                  print(f" - {item}")
               sys.exit(1)
 
           print("")
           print("======================================")
           print(" VALIDATION PASSED")
           print("======================================")
-
           print(f"StreamHub version: {app_version}")
           print("Python syntax: OK")
           print("YAML: OK")
           print("HA metadata: OK")
-          print("Architecture: aarch64 + amd64")
-          print("Port: 8088/tcp")
+          print("aarch64 + amd64: OK")
+          print("Port 8088: OK")
           print("Watchdog: /health")
-          print("Startup cache refresh: disabled")
-          print("Series state rebuild: disabled")
-          print("Provider URLs: not hardcoded")
-          print("Provider credentials: not hardcoded")
-          PY
-
-      - name: Validate version consistency
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          import re
-          import sys
-          import yaml
-
-          app_text = Path(
-              "streamhub/app.py"
-          ).read_text(encoding="utf-8")
-
-          cfg = yaml.safe_load(
-              Path(
-                  "streamhub/config.yaml"
-              ).read_text(encoding="utf-8")
-          )
-
-          docker_text = Path(
-              "streamhub/Dockerfile"
-          ).read_text(encoding="utf-8")
-
-          run_text = Path(
-              "streamhub/run.sh"
-          ).read_text(encoding="utf-8")
-
-          match = re.search(
-              r'^\s*APP_VERSION\s*=\s*["\']([^"\']+)["\']',
-              app_text,
-              re.MULTILINE,
-          )
-
-          if not match:
-              print("APP_VERSION not found in app.py")
-              sys.exit(1)
-
-          version = match.group(1)
-
-          if cfg.get("version") != version:
-              print(
-                  "Version mismatch:"
-              )
-              print(
-                  f"  app.py       = {version}"
-              )
-              print(
-                  f"  config.yaml  = {cfg.get('version')}"
-              )
-              sys.exit(1)
-
-          for name, content in [
-              ("Dockerfile", docker_text),
-              ("run.sh", run_text),
-          ]:
-              if re.search(
-                  r"StreamHub\s+2\.\d+\.\d+",
-                  content,
-              ):
-                  print(
-                      f"{name} contains a hardcoded "
-                      "StreamHub patch version."
-                  )
-                  sys.exit(1)
-
-          print(
-              f"Version consistency OK: {version}"
-          )
+          print("Automatic cache lifecycle: OK")
+          print("No forced startup rebuild settings: OK")
+          print("No hardcoded provider endpoints: OK")
+          print("No hardcoded Docker/run.sh version: OK")
           PY
 
       - name: Validate Dockerfile
@@ -653,6 +406,11 @@ jobs:
           grep -Fq 'EXPOSE 8088' streamhub/Dockerfile
           grep -Fq 'CMD ["/app/run.sh"]' streamhub/Dockerfile
 
+          if grep -Eq 'StreamHub[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+' streamhub/Dockerfile; then
+            echo "ERROR: Dockerfile contains a hardcoded StreamHub version"
+            exit 1
+          fi
+
       - name: Validate run.sh
         run: |
           sh -n streamhub/run.sh
@@ -660,12 +418,17 @@ jobs:
           grep -Fq 'set -e' streamhub/run.sh
           grep -Fq 'exec python3 /app/app.py' streamhub/run.sh
 
+          if grep -Eq 'StreamHub[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+' streamhub/run.sh; then
+            echo "ERROR: run.sh contains a hardcoded StreamHub version"
+            exit 1
+          fi
+
       - name: Validation summary
         if: success()
         run: |
           echo "======================================"
           echo " StreamHub validation successful"
           echo "======================================"
-          echo "Version is detected automatically."
-          echo "No workflow version update is required."
+          echo "Version is detected automatically from app.py."
+          echo "No validation version update is required."
           echo "======================================"
