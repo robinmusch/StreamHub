@@ -15,7 +15,7 @@ from urllib.request import Request, urlopen
 
 
 APP_NAME = "StreamHub"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 
 HOST = "0.0.0.0"
 PORT = 8088
@@ -51,6 +51,7 @@ DEFAULT_CONFIG = {
     "health_check_seconds": 900,
     "backup_health_check_seconds": 21600,
     "health_timeout_seconds": 8,
+    "stream_read_timeout_seconds": 30,
 
     "series_workers": 1,
     "series_request_delay": 1.5,
@@ -394,6 +395,9 @@ def item_matches_content(
 
 STATE_LOCK = threading.RLock()
 CACHE_LOCK = threading.Lock()
+SOURCE_RESOLUTION_LOCK = threading.Lock()
+SOURCE_RESOLUTION_CACHE = {}
+SOURCE_RESOLUTION_TTL_SECONDS = 900
 
 STATE = {
     "started": False,
@@ -3572,6 +3576,549 @@ def xtream_profile(request):
 
 
 # ============================================================================
+# STREAM SOURCE RESOLUTION / PROXY
+# ============================================================================
+
+def stream_read_timeout():
+    return max(
+        5,
+        safe_int(
+            CONFIG.get(
+                "stream_read_timeout_seconds",
+                30,
+            ),
+            30,
+        ),
+    )
+
+
+def provider_candidates(preferred_server=None):
+    servers = configured_servers()
+
+    with STATE_LOCK:
+        states = {
+            server: dict(
+                STATE["servers"].get(server, {})
+            )
+            for server in servers
+        }
+
+    healthy = [
+        server
+        for server in servers
+        if states.get(server, {}).get("online") is True
+    ]
+
+    ordered = []
+
+    if preferred_server in healthy:
+        ordered.append(preferred_server)
+
+    active, _ = get_active_provider_snapshot()
+
+    if active in healthy and active not in ordered:
+        ordered.append(active)
+
+    remaining = [
+        server
+        for server in healthy
+        if server not in ordered
+    ]
+
+    remaining.sort(
+        key=lambda server: (
+            states.get(server, {}).get("response_time_ms")
+            if isinstance(
+                states.get(server, {}).get("response_time_ms"),
+                (int, float),
+            )
+            else float("inf"),
+            servers.index(server),
+        )
+    )
+
+    ordered.extend(remaining)
+
+    return ordered
+
+
+def cached_source_for(cache_type, item, provider_priority):
+    try:
+        cached_priority = safe_int(
+            item.get("_streamhub", {}).get("provider_priority"),
+            0,
+        )
+    except Exception:
+        cached_priority = 0
+
+    if cached_priority != provider_priority:
+        return None
+
+    if cache_type in {"tv", "movies"}:
+        stream_id = item.get("stream_id")
+        if stream_id is not None and str(stream_id).strip():
+            return {
+                "stream_id": str(stream_id).strip(),
+                "container_extension": stream_extension(item, "ts" if cache_type == "tv" else "mp4"),
+            }
+
+    return None
+
+
+def find_provider_catalog_match(items, target_item):
+    target_name = normalize_identity_text(
+        catalog_name(target_item)
+    )
+    target_category = normalize_identity_text(
+        catalog_category_name(target_item)
+    )
+    target_year = str(
+        target_item.get("year", "")
+        or target_item.get("releaseDate", "")
+        or ""
+    ).strip()
+
+    exact = []
+    name_only = []
+
+    for item in as_list(items):
+        if not isinstance(item, dict):
+            continue
+
+        if normalize_identity_text(catalog_name(item)) != target_name:
+            continue
+
+        item_category = normalize_identity_text(
+            item.get("category_name", "")
+            or target_category
+        )
+
+        if target_category and item_category == target_category:
+            exact.append(item)
+        else:
+            name_only.append(item)
+
+    candidates = exact or name_only
+
+    if not candidates:
+        return None
+
+    if target_year:
+        for item in candidates:
+            item_year = str(
+                item.get("year", "")
+                or item.get("releaseDate", "")
+                or ""
+            ).strip()
+            if item_year and item_year == target_year:
+                return item
+
+    return candidates[0]
+
+
+def find_provider_series_match(items, target_series):
+    return find_provider_catalog_match(
+        items,
+        target_series,
+    )
+
+
+def find_cached_episode(episode_id):
+    for series_item in load_cache_items("series"):
+        for episode in flatten_series_episodes(series_item):
+            if episode_state_key(series_item, episode) == str(episode_id):
+                return series_item, episode
+    return None, None
+
+
+def resolve_stream_source(cache_type, item, server, priority):
+    """Resolve a provider-specific source for a provider-independent StreamHub ID."""
+    item_id = (
+        episode_state_key(item[0], item[1])
+        if cache_type == "series"
+        else streamhub_id(cache_type, item)
+    )
+    cache_key = (cache_type, item_id, priority)
+    now = time.time()
+
+    with SOURCE_RESOLUTION_LOCK:
+        cached = SOURCE_RESOLUTION_CACHE.get(cache_key)
+        if cached and now - cached["created_at"] <= SOURCE_RESOLUTION_TTL_SECONDS:
+            return cached["source"]
+
+    try:
+        if cache_type == "tv":
+            streams = fetch_xtream_action(server, "get_live_streams")
+            match = find_provider_catalog_match(streams, item)
+            if not match or match.get("stream_id") is None:
+                return None
+            source = {
+                "stream_id": str(match["stream_id"]),
+                "container_extension": "ts",
+            }
+
+        elif cache_type == "movies":
+            streams = fetch_xtream_action(server, "get_vod_streams")
+            match = find_provider_catalog_match(streams, item)
+            if not match or match.get("stream_id") is None:
+                return None
+            source = {
+                "stream_id": str(match["stream_id"]),
+                "container_extension": stream_extension(match, "mp4"),
+            }
+
+        elif cache_type == "series":
+            series_item, episode = item
+            series_list = fetch_xtream_action(server, "get_series")
+            target_series = find_provider_series_match(series_list, series_item)
+            if not target_series or target_series.get("series_id") is None:
+                return None
+
+            details = fetch_xtream_action(
+                server,
+                "get_series_info",
+                {"series_id": target_series["series_id"]},
+            )
+
+            target_season = safe_int(episode.get("season", 0), 0)
+            target_episode_num = safe_int(episode.get("episode_num", 0), 0)
+            target_title = normalize_identity_text(episode.get("title", ""))
+
+            matches = []
+            for candidate in flatten_provider_episodes(details.get("episodes", {})):
+                if safe_int(candidate.get("season", 0), 0) != target_season:
+                    continue
+                if safe_int(candidate.get("episode_num", 0), 0) != target_episode_num:
+                    continue
+                matches.append(candidate)
+
+            if target_title:
+                titled = [
+                    candidate
+                    for candidate in matches
+                    if normalize_identity_text(candidate.get("title", "")) == target_title
+                ]
+                matches = titled or matches
+
+            if not matches or matches[0].get("id") is None:
+                return None
+
+            source = {
+                "stream_id": str(matches[0]["id"]),
+                "container_extension": stream_extension(
+                    matches[0],
+                    stream_extension(episode, "mp4"),
+                ),
+            }
+        else:
+            return None
+
+    except Exception as exc:
+        LOGGER.warning(
+            "Unable to resolve %s source on P%d: %s",
+            cache_type,
+            priority,
+            type(exc).__name__,
+        )
+        return None
+
+    with SOURCE_RESOLUTION_LOCK:
+        SOURCE_RESOLUTION_CACHE[cache_key] = {
+            "created_at": now,
+            "source": source,
+        }
+
+    return source
+
+
+def flatten_provider_episodes(episodes):
+    if not isinstance(episodes, dict):
+        return []
+
+    result = []
+    for season_key, values in episodes.items():
+        if not isinstance(values, list):
+            continue
+        for episode in values:
+            if not isinstance(episode, dict):
+                continue
+            item = dict(episode)
+            item.setdefault("season", safe_int(season_key, 0))
+            result.append(item)
+    return result
+
+
+def upstream_stream_url(server, cache_type, source):
+    username = quote(str(CONFIG.get("server_username", "") or ""), safe="")
+    password = quote(str(CONFIG.get("server_password", "") or ""), safe="")
+    stream_id = quote(str(source["stream_id"]), safe="")
+
+    if cache_type == "tv":
+        return f"{server}/live/{username}/{password}/{stream_id}.ts"
+
+    extension = str(source.get("container_extension", "mp4") or "mp4").lstrip(".")
+
+    if cache_type == "movies":
+        return f"{server}/movie/{username}/{password}/{stream_id}.{extension}"
+
+    return f"{server}/series/{username}/{password}/{stream_id}.{extension}"
+
+
+def mark_provider_stream_failure(server, reason):
+    with STATE_LOCK:
+        state = STATE["servers"].setdefault(server, {})
+        state.update({
+            "online": False,
+            "reason": f"stream_{reason}",
+            "last_stream_failure": now_unix(),
+        })
+
+    LOGGER.warning(
+        "Provider marked offline after stream failure: %s",
+        server,
+    )
+    select_active_server()
+
+
+def open_upstream_stream(url, range_header=None):
+    headers = {
+        "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+        "Accept": "*/*",
+        "Connection": "close",
+    }
+
+    if range_header:
+        headers["Range"] = range_header
+
+    request = Request(
+        url,
+        headers=headers,
+        method="GET",
+    )
+
+    return urlopen(
+        request,
+        timeout=stream_read_timeout(),
+    )
+
+
+def proxy_stream(handler, cache_type, identifier, extension):
+    if cache_type == "series":
+        series_item, episode = find_cached_episode(identifier)
+        if series_item is None or episode is None:
+            send_json(
+                handler,
+                404,
+                {"status": "error", "error": "episode_not_found"},
+            )
+            return
+        target_item = (series_item, episode)
+    else:
+        target_item = find_cached_item(cache_type, identifier)
+        if target_item is None:
+            send_json(
+                handler,
+                404,
+                {"status": "error", "error": "stream_not_found"},
+            )
+            return
+
+    preferred_server, _ = get_active_provider_snapshot()
+    candidates = provider_candidates(preferred_server)
+
+    if not candidates:
+        send_json(
+            handler,
+            503,
+            {"status": "error", "error": "no_healthy_provider"},
+        )
+        return
+
+    range_header = handler.headers.get("Range")
+    last_error = "upstream_unavailable"
+    headers_sent = False
+    bytes_sent = 0
+
+    for server in candidates:
+        priority = configured_servers().index(server) + 1
+        response = None
+
+        try:
+            source = cached_source_for(
+                cache_type,
+                target_item if cache_type != "series" else series_item,
+                priority,
+            )
+
+            if cache_type == "series" or source is None:
+                source = resolve_stream_source(
+                    cache_type,
+                    target_item,
+                    server,
+                    priority,
+                )
+
+            if not source:
+                last_error = "source_not_found"
+                continue
+
+            upstream_url = upstream_stream_url(
+                server,
+                cache_type,
+                source,
+            )
+
+            LOGGER.info(
+                "Opening %s stream via P%d",
+                cache_type,
+                priority,
+            )
+
+            # Een Range-header is alleen relevant voor de eerste provider.
+            # Bij live failover starten we bewust een nieuwe MPEG-TS stream.
+            request_range = range_header if not headers_sent else None
+            response = open_upstream_stream(
+                upstream_url,
+                request_range,
+            )
+
+            status = getattr(response, "status", 200)
+            if not 200 <= status < 300:
+                response.close()
+                response = None
+                mark_provider_stream_failure(server, f"http_{status}")
+                last_error = f"http_{status}"
+                continue
+
+            # Lees eerst een chunk. Zo kunnen we bij een upstream die direct
+            # faalt nog naar de volgende provider voordat we headers naar
+            # TiviMate hebben gestuurd.
+            first_chunk = response.read(64 * 1024)
+            if not first_chunk:
+                response.close()
+                response = None
+                mark_provider_stream_failure(server, "empty_response")
+                last_error = "empty_response"
+                continue
+
+            if not headers_sent:
+                handler.send_response(status)
+
+                forwarded_headers = {
+                    "Content-Type": response.headers.get("Content-Type"),
+                    "Content-Length": (
+                        None
+                        if cache_type == "tv"
+                        else response.headers.get("Content-Length")
+                    ),
+                    "Content-Range": response.headers.get("Content-Range"),
+                    "Accept-Ranges": response.headers.get("Accept-Ranges"),
+                    "Cache-Control": response.headers.get("Cache-Control"),
+                    "ETag": response.headers.get("ETag"),
+                }
+
+                for header, value in forwarded_headers.items():
+                    if value:
+                        handler.send_header(header, value)
+
+                handler.send_header(
+                    "X-StreamHub-Provider",
+                    str(priority),
+                )
+                handler.end_headers()
+                headers_sent = True
+
+            handler.wfile.write(first_chunk)
+            handler.wfile.flush()
+            bytes_sent += len(first_chunk)
+
+            while True:
+                try:
+                    chunk = response.read(64 * 1024)
+                except (BrokenPipeError, ConnectionResetError):
+                    response.close()
+                    return
+                except Exception as exc:
+                    last_error = type(exc).__name__
+                    mark_provider_stream_failure(server, last_error)
+                    response.close()
+                    response = None
+
+                    # Alleen live MPEG-TS kan veilig binnen dezelfde HTTP
+                    # response opnieuw aan een andere provider worden gekoppeld.
+                    if cache_type == "tv":
+                        LOGGER.warning(
+                            "Live stream failed after %d bytes; trying next provider",
+                            bytes_sent,
+                        )
+                        break
+
+                    return
+
+                if not chunk:
+                    response.close()
+                    LOGGER.info(
+                        "Stream completed via P%d (%d bytes)",
+                        priority,
+                        bytes_sent,
+                    )
+                    return
+
+                try:
+                    handler.wfile.write(chunk)
+                    handler.wfile.flush()
+                    bytes_sent += len(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    response.close()
+                    return
+
+            # Mid-stream live failover: ga door naar de volgende provider
+            # zonder opnieuw HTTP headers te sturen.
+            continue
+
+        except (BrokenPipeError, ConnectionResetError):
+            if response is not None:
+                response.close()
+            return
+        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            if response is not None:
+                response.close()
+            last_error = type(exc).__name__
+            mark_provider_stream_failure(server, last_error)
+            continue
+        except Exception as exc:
+            if response is not None:
+                response.close()
+            last_error = type(exc).__name__
+            LOGGER.warning(
+                "Stream proxy failed on P%d: %s",
+                priority,
+                last_error,
+            )
+            continue
+
+    if headers_sent:
+        # Bij live failover zijn headers al naar de client gestuurd. De enige
+        # correcte actie wanneer alle providers daarna falen is de verbinding
+        # beëindigen; een tweede HTTP-response is niet geldig.
+        LOGGER.error(
+            "All providers failed during live stream after %d bytes",
+            bytes_sent,
+        )
+        return
+
+    send_json(
+        handler,
+        502,
+        {
+            "status": "error",
+            "error": "stream_unavailable",
+            "reason": last_error,
+        },
+    )
+
+
+# ============================================================================
 # HTTP RESPONSE
 # ============================================================================
 
@@ -4246,36 +4793,30 @@ class StreamHubHandler(
             return
 
         # ------------------------------------------------------------
-        # PROXY PLACEHOLDER
-        # ------------------------------------------------------------
-        #
-        # Bewust nog niet geïmplementeerd.
-        # Dit wordt de volgende stap:
-        #
-        # /live/<id>.ts
-        # /movie/<id>.<ext>
-        # /series/<id>.<ext>
-        #
+        # STREAM PROXY
         # ------------------------------------------------------------
 
-        if (
-            path.startswith("/live/")
-            or path.startswith("/movie/")
-            or path.startswith("/series/")
-        ):
-            send_json(
-                self,
-                501,
-                {
-                    "status": "not_ready",
-                    "error": (
-                        "stream_proxy_not_implemented"
-                    ),
-                    "message": (
-                        "Stream proxy is part of the next release."
-                    ),
-                },
-            )
+        if path.startswith("/live/"):
+            identifier = path[len("/live/"):].rsplit(".", 1)[0]
+            proxy_stream(self, "tv", identifier, "ts")
+            return
+
+        if path.startswith("/movie/"):
+            filename = path[len("/movie/"):]
+            identifier, _, extension = filename.rpartition(".")
+            if not identifier or not extension:
+                send_json(self, 400, {"status": "error", "error": "invalid_movie_path"})
+                return
+            proxy_stream(self, "movies", identifier, extension)
+            return
+
+        if path.startswith("/series/"):
+            filename = path[len("/series/"):]
+            identifier, _, extension = filename.rpartition(".")
+            if not identifier or not extension:
+                send_json(self, 400, {"status": "error", "error": "invalid_series_path"})
+                return
+            proxy_stream(self, "series", identifier, extension)
             return
 
         # ------------------------------------------------------------
