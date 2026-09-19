@@ -1,7 +1,7 @@
-#!/usr/bin/with-contenv bashio
+#!/bin/sh
 
 set -e
 
-bashio::log.info "Starting StreamHub 2.0.0..."
+echo "Starting StreamHub 2.0.1..."
 
 exec python3 /app/app.py
