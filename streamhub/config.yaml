@@ -23,55 +23,31 @@ map:
     read_only: false
 
 options:
-  access_key: ""
+  public_host: ""
+
+  # Provider servers are intentionally empty in the public repository.
+  servers: []
+
+  server_username: ""
+  server_password: ""
+
+  proxy_access_key: ""
 
   provider_mode: "AUTO"
   forced_provider_priority: 0
 
-  providers: []
+  content_filter: "ALL"
+  custom_marker: ""
 
-  content_filter:
-    enabled: true
-    countries:
-      - NL
-      - BE
-      - DE
-      - FR
-      - UK
-      - US
-      - ES
-      - IT
-      - PT
-      - TR
-      - CUSTOM
-      - ALL
-
-  cache:
-    enabled: true
-
-    tv:
-      enabled: true
-      ttl_hours: 24
-
-    movies:
-      enabled: true
-      ttl_hours: 12
-
-    series:
-      enabled: true
-      ttl_hours: 12
+  tv_cache_hours: 24
+  movies_cache_hours: 12
+  series_cache_hours: 12
 
   health_check_seconds: 900
   backup_health_check_seconds: 21600
   health_timeout_seconds: 8
 
-  stream_proxy:
-    enabled: true
-    connect_timeout_seconds: 8
-    read_timeout_seconds: 30
-    chunk_size: 65536
-    retry_failed_provider: true
-    max_provider_retries: 0
+  stream_read_timeout_seconds: 30
 
   series_workers: 1
   series_request_delay: 1.5
@@ -80,49 +56,31 @@ options:
   epg_url: ""
 
 schema:
-  access_key: password
+  public_host: str
+
+  servers:
+    - str
+
+  server_username: password
+  server_password: password
+
+  proxy_access_key: password
 
   provider_mode: list(AUTO|FORCED)
   forced_provider_priority: int
 
-  providers:
-    - name: str
-      priority: int
-      url: str
-      username: password
-      password: password
+  content_filter: str
+  custom_marker: str
 
-  content_filter:
-    enabled: bool
-    countries:
-      - str
-
-  cache:
-    enabled: bool
-
-    tv:
-      enabled: bool
-      ttl_hours: int
-
-    movies:
-      enabled: bool
-      ttl_hours: int
-
-    series:
-      enabled: bool
-      ttl_hours: int
+  tv_cache_hours: int
+  movies_cache_hours: int
+  series_cache_hours: int
 
   health_check_seconds: int
   backup_health_check_seconds: int
   health_timeout_seconds: int
 
-  stream_proxy:
-    enabled: bool
-    connect_timeout_seconds: int
-    read_timeout_seconds: int
-    chunk_size: int
-    retry_failed_provider: bool
-    max_provider_retries: int
+  stream_read_timeout_seconds: int
 
   series_workers: int
   series_request_delay: float
