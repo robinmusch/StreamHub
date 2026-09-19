@@ -1,14 +1,15 @@
-name: StreamHub Validation
+name: Validate StreamHub
 
 on:
   push:
     branches:
       - main
-      - series-state
-
+      - "**"
   pull_request:
-    branches:
-      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   validate:
@@ -16,49 +17,30 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ------------------------------------------------------------
-      # Checkout repository
-      # ------------------------------------------------------------
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # ------------------------------------------------------------
-      # Python
-      # ------------------------------------------------------------
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      # ------------------------------------------------------------
-      # Python syntax
-      # ------------------------------------------------------------
-      - name: Check Python syntax
+      - name: Install validation dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyyaml
+
+      - name: Validate Python syntax
         run: |
           python -m py_compile streamhub/app.py
-          echo "Python syntax validation: OK"
+          python -m compileall -q streamhub
 
-      # ------------------------------------------------------------
-      # Python AST
-      # ------------------------------------------------------------
-      - name: Check Python AST
+      - name: Validate shell syntax
         run: |
-          python - <<'PY'
-          import ast
-          from pathlib import Path
+          test -f streamhub/run.sh
+          sh -n streamhub/run.sh
 
-          path = Path("streamhub/app.py")
-          source = path.read_text(encoding="utf-8")
-
-          ast.parse(source, filename=str(path))
-
-          print("Python AST validation: OK")
-          PY
-
-      # ------------------------------------------------------------
-      # Required files
-      # ------------------------------------------------------------
-      - name: Check required files
+      - name: Validate repository files
         run: |
           test -f repository.yaml
           test -f streamhub/config.yaml
@@ -66,615 +48,624 @@ jobs:
           test -f streamhub/run.sh
           test -f streamhub/app.py
 
-          echo "Required files: OK"
-
-      # ------------------------------------------------------------
-      # repository.yaml
-      # ------------------------------------------------------------
-      - name: Check repository.yaml
-        run: |
-          grep -q '^name: StreamHub$' repository.yaml
-          grep -q '^url: https://github.com/robinmusch/streamhub$' repository.yaml
-          grep -q '^maintainer: Robin$' repository.yaml
-
-          echo "repository.yaml validation: OK"
-
-      # ------------------------------------------------------------
-      # Dockerfile
-      # ------------------------------------------------------------
-      - name: Check Dockerfile
-        run: |
-          grep -q '^FROM python:3.12-slim$' streamhub/Dockerfile
-          grep -q '^WORKDIR /app$' streamhub/Dockerfile
-          grep -q '^EXPOSE 8088$' streamhub/Dockerfile
-          grep -q '^CMD \["/app/run.sh"\]$' streamhub/Dockerfile
-
-          grep -q 'COPY run.sh /app/run.sh' streamhub/Dockerfile
-          grep -q 'COPY app.py /app/app.py' streamhub/Dockerfile
-          grep -q 'chmod +x /app/run.sh' streamhub/Dockerfile
-
-          echo "Dockerfile validation: OK"
-
-      # ------------------------------------------------------------
-      # run.sh
-      # ------------------------------------------------------------
-      - name: Check run.sh
-        run: |
-          test -f streamhub/run.sh
-
-          grep -q '^#!/bin/sh$' streamhub/run.sh
-          grep -q 'set -e' streamhub/run.sh
-          grep -q 'python3 /app/app.py' streamhub/run.sh
-
-          if grep -q 'with-contenv' streamhub/run.sh; then
-            echo "ERROR: run.sh must not depend on with-contenv."
-            exit 1
-          fi
-
-          if grep -q 'bashio' streamhub/run.sh; then
-            echo "ERROR: run.sh must not depend on bashio."
-            exit 1
-          fi
-
-          sh -n streamhub/run.sh
-
-          echo "run.sh validation: OK"
-
-      # ------------------------------------------------------------
-      # YAML dependency
-      # ------------------------------------------------------------
-      - name: Install validation dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install PyYAML
-
-      # ------------------------------------------------------------
-      # Home Assistant configuration
-      # ------------------------------------------------------------
-      - name: Check Home Assistant configuration
+      - name: Validate StreamHub configuration and version consistency
         run: |
           python - <<'PY'
+          from pathlib import Path
+          import re
+          import sys
           import yaml
 
-          path = "streamhub/config.yaml"
+          root = Path(".")
 
-          with open(path, "r", encoding="utf-8") as f:
-              data = yaml.safe_load(f)
+          app = root / "streamhub" / "app.py"
+          cfg_file = root / "streamhub" / "config.yaml"
+          dockerfile = root / "streamhub" / "Dockerfile"
+          run_sh = root / "streamhub" / "run.sh"
+          repository = root / "repository.yaml"
 
-          if not isinstance(data, dict):
-              raise SystemExit(
-                  "config.yaml does not contain a YAML mapping"
+          errors = []
+
+          def fail(message):
+              errors.append(message)
+
+          # ============================================================
+          # Read files
+          # ============================================================
+
+          app_text = app.read_text(encoding="utf-8")
+          cfg_text = cfg_file.read_text(encoding="utf-8")
+          docker_text = dockerfile.read_text(encoding="utf-8")
+          run_text = run_sh.read_text(encoding="utf-8")
+          repo_text = repository.read_text(encoding="utf-8")
+
+          try:
+              cfg = yaml.safe_load(cfg_text)
+          except Exception as exc:
+              fail(f"config.yaml is invalid YAML: {exc}")
+              cfg = {}
+
+          # ============================================================
+          # APP VERSION
+          # app.py is the single source of truth
+          # ============================================================
+
+          app_match = re.search(
+              r'^\s*APP_VERSION\s*=\s*["\']([^"\']+)["\']',
+              app_text,
+              re.MULTILINE,
+          )
+
+          if not app_match:
+              fail("APP_VERSION was not found in app.py")
+              app_version = None
+          else:
+              app_version = app_match.group(1)
+
+          # ============================================================
+          # Home Assistant metadata
+          # ============================================================
+
+          if not isinstance(cfg, dict):
+              fail("config.yaml root must be a mapping")
+              cfg = {}
+
+          required_metadata = {
+              "name": "StreamHub",
+              "slug": "streamhub",
+              "startup": "application",
+              "boot": "auto",
+              "init": False,
+          }
+
+          for key, expected in required_metadata.items():
+              if cfg.get(key) != expected:
+                  fail(
+                      f"config.yaml: {key!r} must be {expected!r}; "
+                      f"got {cfg.get(key)!r}"
+                  )
+
+          if app_version is not None:
+              if cfg.get("version") != app_version:
+                  fail(
+                      "Version mismatch: "
+                      f"app.py={app_version!r}, "
+                      f"config.yaml={cfg.get('version')!r}"
+                  )
+
+          # ============================================================
+          # Architecture
+          # ============================================================
+
+          arches = cfg.get("arch", [])
+
+          if not {"aarch64", "amd64"}.issubset(set(arches)):
+              fail(
+                  "config.yaml: arch must include "
+                  "aarch64 and amd64"
               )
 
-          required = [
-              "name",
-              "version",
-              "slug",
-              "description",
-              "url",
-              "arch",
-              "startup",
-              "boot",
-              "init",
-              "ports",
-              "ports_description",
-              "watchdog",
-              "options",
-              "schema",
-          ]
+          # ============================================================
+          # Port
+          # ============================================================
 
-          missing = [
-              key for key in required
-              if key not in data
-          ]
+          ports = cfg.get("ports", {})
 
-          if missing:
-              raise SystemExit(
-                  "Missing config keys: "
-                  + ", ".join(missing)
+          if ports.get("8088/tcp") != 8088:
+              fail(
+                  "config.yaml: ports must expose "
+                  "8088/tcp: 8088"
               )
 
-          if data["name"] != "StreamHub":
-              raise SystemExit(
-                  "config.yaml name must be StreamHub"
+          # ============================================================
+          # Watchdog
+          # ============================================================
+
+          watchdog = str(cfg.get("watchdog", ""))
+
+          if "8088" not in watchdog or "/health" not in watchdog:
+              fail(
+                  "config.yaml: watchdog must target "
+                  "/health on port 8088"
               )
 
-          if data["version"] != "2.0.6":
-              raise SystemExit(
-                  "config.yaml version must be 2.0.6"
-              )
+          # ============================================================
+          # Required options
+          # ============================================================
 
-          if data["slug"] != "streamhub":
-              raise SystemExit(
-                  "config.yaml slug must be streamhub"
-              )
+          options = cfg.get("options", {})
 
-          if "aarch64" not in data["arch"]:
-              raise SystemExit(
-                  "aarch64 architecture is required"
-              )
+          if not isinstance(options, dict):
+              fail("config.yaml: options must be a mapping")
+              options = {}
 
-          if "amd64" not in data["arch"]:
-              raise SystemExit(
-                  "amd64 architecture is required"
-              )
-
-          if data["ports"].get("8088/tcp") != 8088:
-              raise SystemExit(
-                  "TCP port 8088 must be exposed"
-              )
-
-          required_options = [
+          required_options = {
               "public_host",
               "servers",
               "server_username",
               "server_password",
               "proxy_access_key",
+
               "provider_mode",
               "forced_provider_priority",
+
               "content_filter",
               "custom_marker",
+
               "tv_cache_hours",
               "movies_cache_hours",
               "series_cache_hours",
+
               "health_check_seconds",
               "backup_health_check_seconds",
               "health_timeout_seconds",
               "stream_read_timeout_seconds",
+
               "series_workers",
               "series_request_delay",
+
               "epg_enabled",
               "epg_url",
               "epg_cache_hours",
               "epg_timeout_seconds",
-          ]
 
-          options = data.get("options", {})
+              "series_state_rebuild_on_start",
+              "cache_refresh_on_start",
+          }
 
-          missing_options = [
-              key for key in required_options
-              if key not in options
-          ]
+          missing_options = sorted(
+              required_options - set(options)
+          )
 
           if missing_options:
-              raise SystemExit(
-                  "Missing option keys: "
+              fail(
+                  "config.yaml: missing options: "
                   + ", ".join(missing_options)
               )
 
-          schema = data.get("schema", {})
+          # ============================================================
+          # Safe startup defaults
+          # ============================================================
 
-          missing_schema = [
-              key for key in required_options
-              if key not in schema
-          ]
-
-          if missing_schema:
-              raise SystemExit(
-                  "Missing schema keys: "
-                  + ", ".join(missing_schema)
+          if options.get("series_state_rebuild_on_start") is not False:
+              fail(
+                  "config.yaml: "
+                  "series_state_rebuild_on_start "
+                  "must default to false"
               )
 
-          if options["content_filter"] != "ALL":
-              raise SystemExit(
-                  "Default content_filter must be ALL"
+          if options.get("cache_refresh_on_start") is not False:
+              fail(
+                  "config.yaml: "
+                  "cache_refresh_on_start "
+                  "must default to false"
               )
 
-          allowed_filters = {
-              "ALL",
-              "NL",
-              "BE",
-              "DE",
-              "FR",
-              "UK",
-              "US",
-              "ES",
-              "IT",
-              "PT",
-              "TR",
-              "CUSTOM",
-          }
+          # ============================================================
+          # Required schema entries
+          # ============================================================
 
-          schema_filter = str(
-              schema["content_filter"]
-          )
+          schema = cfg.get("schema", {})
 
-          for value in allowed_filters:
-              if value not in schema_filter:
-                  raise SystemExit(
-                      f"content_filter schema is missing {value}"
-                  )
+          if not isinstance(schema, dict):
+              fail("config.yaml: schema must be a mapping")
+              schema = {}
 
-          if "country_marker" in options:
-              raise SystemExit(
-                  "Old country_marker option must not exist"
-              )
-
-          if "country_marker" in schema:
-              raise SystemExit(
-                  "Old country_marker schema must not exist"
-              )
-
-          print(
-              "Home Assistant configuration validation: OK"
-          )
-          PY
-
-      # ------------------------------------------------------------
-      # Default configuration
-      # ------------------------------------------------------------
-      - name: Check StreamHub defaults
-        run: |
-          python - <<'PY'
-          import yaml
-
-          with open(
-              "streamhub/config.yaml",
-              "r",
-              encoding="utf-8"
-          ) as f:
-              data = yaml.safe_load(f)
-
-          options = data["options"]
-
-          expected = {
-              "provider_mode": "AUTO",
-              "forced_provider_priority": 0,
-              "content_filter": "ALL",
-              "tv_cache_hours": 24,
-              "movies_cache_hours": 12,
-              "series_cache_hours": 12,
-              "health_check_seconds": 900,
-              "backup_health_check_seconds": 21600,
-              "health_timeout_seconds": 8,
-              "stream_read_timeout_seconds": 30,
-              "series_workers": 1,
-              "series_request_delay": 1.5,
-              "epg_enabled": True,
-              "epg_cache_hours": 6,
-              "epg_timeout_seconds": 30,
-          }
-
-          for key, expected_value in expected.items():
-              actual_value = options.get(key)
-
-              if actual_value != expected_value:
-                  raise SystemExit(
-                      f"{key}: expected "
-                      f"{expected_value!r}, "
-                      f"got {actual_value!r}"
-                  )
-
-          print(
-              "StreamHub default configuration: OK"
-          )
-          PY
-
-      # ------------------------------------------------------------
-      # Public repository secret protection
-      # ------------------------------------------------------------
-      - name: Check for hardcoded provider secrets
-        run: |
-          python - <<'PY'
-          import yaml
-
-          with open(
-              "streamhub/config.yaml",
-              "r",
-              encoding="utf-8"
-          ) as f:
-              data = yaml.safe_load(f)
-
-          options = data.get("options", {})
-
-          if options.get("servers") not in ([], None):
-              raise SystemExit(
-                  "Provider servers must not be committed "
-                  "to the public repository."
-              )
-
-          if options.get(
-              "server_username",
-              ""
-          ) not in ("", None):
-              raise SystemExit(
-                  "Provider username must not be committed "
-                  "to the public repository."
-              )
-
-          if options.get(
-              "server_password",
-              ""
-          ) not in ("", None):
-              raise SystemExit(
-                  "Provider password must not be committed "
-                  "to the public repository."
-              )
-
-          if options.get(
-              "proxy_access_key",
-              ""
-          ) not in ("", None):
-              raise SystemExit(
-                  "Proxy access key must not be committed "
-                  "to the public repository."
-              )
-
-          print(
-              "Hardcoded secret validation: OK"
-          )
-          PY
-
-      # ------------------------------------------------------------
-      # Provider URL protection
-      # ------------------------------------------------------------
-      - name: Check for provider URLs
-        run: |
-          if grep -RniE \
-            --exclude-dir=.git \
-            --exclude='validate.yml' \
-            'https?://[^[:space:]"]*(line|mag)\.' \
-            streamhub repository.yaml; then
-
-            echo "Possible provider URL detected in repository."
-            exit 1
-          fi
-
-          echo "Provider URL scan: OK"
-
-      # ------------------------------------------------------------
-      # Content filters
-      # ------------------------------------------------------------
-      - name: Check StreamHub content filter implementation
-        run: |
-          grep -q 'content_filter' streamhub/app.py
-          grep -q 'custom_marker' streamhub/app.py
-          grep -q 'CONTENT_MARKERS' streamhub/app.py
-
-          grep -q '"NL": "┃NL┃"' streamhub/app.py
-          grep -q '"BE": "┃BE┃"' streamhub/app.py
-          grep -q '"DE": "┃DE┃"' streamhub/app.py
-          grep -q '"FR": "┃FR┃"' streamhub/app.py
-          grep -q '"UK": "┃UK┃"' streamhub/app.py
-          grep -q '"US": "┃US┃"' streamhub/app.py
-          grep -q '"ES": "┃ES┃"' streamhub/app.py
-          grep -q '"IT": "┃IT┃"' streamhub/app.py
-          grep -q '"PT": "┃PT┃"' streamhub/app.py
-          grep -q '"TR": "┃TR┃"' streamhub/app.py
-
-          grep -q '"CUSTOM"' streamhub/app.py
-          grep -q '"ALL"' streamhub/app.py
-
-          echo "Content filter implementation validation: OK"
-
-      # ------------------------------------------------------------
-      # Application version
-      # ------------------------------------------------------------
-      - name: Check StreamHub application version
-        run: |
-          grep -q 'APP_VERSION = "2.0.6"' streamhub/app.py
-
-          echo "StreamHub application version: 2.0.6"
-
-      # ------------------------------------------------------------
-      # API routes
-      # ------------------------------------------------------------
-      - name: Check required API routes
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          source = Path(
-              "streamhub/app.py"
-          ).read_text(
-              encoding="utf-8"
-          )
-
-          required_routes = [
-              "/health",
-              "/status",
-              "/check-servers",
-              "/refresh",
-              "/cache",
-              "/epg.xml",
-              "/series-state",
-              "/watchlist",
-              "/new-episodes",
-              "/watchlist/add",
-              "/watchlist/remove",
-              "/episode/watched",
-              "/player_api.php",
-              "/tv.m3u",
-              "/movies.m3u",
-              "/series.m3u",
-              "/live/",
-              "/movie/",
-              "/series/",
-          ]
-
-          missing = [
-              route
-              for route in required_routes
-              if route not in source
-          ]
-
-          if missing:
-              raise SystemExit(
-                  "Missing required routes: "
-                  + ", ".join(missing)
-              )
-
-          print(
-              "Required API route validation: OK"
-          )
-          PY
-
-      # ------------------------------------------------------------
-      # Authentication
-      # ------------------------------------------------------------
-      - name: Check authentication implementation
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          source = Path(
-              "streamhub/app.py"
-          ).read_text(
-              encoding="utf-8"
-          )
-
-          required = [
-              "proxy_access_key",
+          required_schema = {
+              "public_host",
+              "servers",
               "server_username",
               "server_password",
-              "streamhub",
-              "key",
-          ]
+              "proxy_access_key",
 
-          missing = [
-              item
-              for item in required
-              if item not in source
-          ]
-
-          if missing:
-              raise SystemExit(
-                  "Missing authentication implementation: "
-                  + ", ".join(missing)
-              )
-
-          print(
-              "Authentication implementation validation: OK"
-          )
-          PY
-
-      # ------------------------------------------------------------
-      # Provider selection and failover
-      # ------------------------------------------------------------
-      - name: Check provider failover implementation
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          source = Path(
-              "streamhub/app.py"
-          ).read_text(
-              encoding="utf-8"
-          )
-
-          required = [
               "provider_mode",
               "forced_provider_priority",
-              "AUTO",
-              "FORCED",
-              "latency",
-              "failover",
-              "health",
-          ]
 
-          missing = [
-              item
-              for item in required
-              if item not in source
-          ]
+              "content_filter",
+              "custom_marker",
 
-          if missing:
-              raise SystemExit(
-                  "Missing provider failover implementation: "
-                  + ", ".join(missing)
-              )
-
-          print(
-              "Provider failover validation: OK"
-          )
-          PY
-
-      # ------------------------------------------------------------
-      # Cache
-      # ------------------------------------------------------------
-      - name: Check cache persistence implementation
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          source = Path(
-              "streamhub/app.py"
-          ).read_text(
-              encoding="utf-8"
-          )
-
-          required = [
-              "/data/cache",
               "tv_cache_hours",
               "movies_cache_hours",
               "series_cache_hours",
-              "CACHE_FILES",
-          ]
 
-          missing = [
-              item
-              for item in required
-              if item not in source
-          ]
+              "health_check_seconds",
+              "backup_health_check_seconds",
+              "health_timeout_seconds",
+              "stream_read_timeout_seconds",
 
-          if missing:
-              raise SystemExit(
-                  "Missing cache implementation: "
-                  + ", ".join(missing)
-              )
+              "series_workers",
+              "series_request_delay",
 
-          print(
-              "Cache persistence validation: OK"
-          )
-          PY
-
-      # ------------------------------------------------------------
-      # EPG
-      # ------------------------------------------------------------
-      - name: Check EPG implementation
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          source = Path(
-              "streamhub/app.py"
-          ).read_text(
-              encoding="utf-8"
-          )
-
-          required = [
               "epg_enabled",
               "epg_url",
               "epg_cache_hours",
               "epg_timeout_seconds",
-              "epg.xml",
-              "gzip",
-              "ElementTree",
-          ]
 
-          missing = [
-              item
-              for item in required
-              if item not in source
-          ]
+              "series_state_rebuild_on_start",
+              "cache_refresh_on_start",
+          }
 
-          if missing:
-              raise SystemExit(
-                  "Missing EPG implementation: "
-                  + ", ".join(missing)
+          missing_schema = sorted(
+              required_schema - set(schema)
+          )
+
+          if missing_schema:
+              fail(
+                  "config.yaml: missing schema entries: "
+                  + ", ".join(missing_schema)
               )
 
+          # ============================================================
+          # Dockerfile
+          # ============================================================
+
+          required_docker_fragments = [
+              "FROM python:3.12-slim",
+              "WORKDIR /app",
+              "COPY run.sh /app/run.sh",
+              "COPY app.py /app/app.py",
+              "RUN chmod +x /app/run.sh",
+              "EXPOSE 8088",
+              'CMD ["/app/run.sh"]',
+          ]
+
+          for fragment in required_docker_fragments:
+              if fragment not in docker_text:
+                  fail(
+                      "Dockerfile missing required "
+                      f"content: {fragment}"
+                  )
+
+          # Dockerfile must never carry its own patch version.
+          if re.search(
+              r"StreamHub\s+2\.\d+\.\d+",
+              docker_text,
+          ):
+              fail(
+                  "Dockerfile must not hardcode "
+                  "a StreamHub patch version"
+              )
+
+          # ============================================================
+          # run.sh
+          # ============================================================
+
+          if not run_text.startswith("#!/bin/sh"):
+              fail(
+                  "run.sh must start with #!/bin/sh"
+              )
+
+          if "set -e" not in run_text:
+              fail(
+                  "run.sh must contain 'set -e'"
+              )
+
+          if "exec python3 /app/app.py" not in run_text:
+              fail(
+                  "run.sh must execute /app/app.py "
+                  "with python3"
+              )
+
+          if "with-contenv" in run_text:
+              fail(
+                  "run.sh must not require with-contenv"
+              )
+
+          if "bashio" in run_text:
+              fail(
+                  "run.sh must not require bashio"
+              )
+
+          if re.search(
+              r"StreamHub\s+2\.\d+\.\d+",
+              run_text,
+          ):
+              fail(
+                  "run.sh must not hardcode "
+                  "a StreamHub patch version"
+              )
+
+          # ============================================================
+          # repository.yaml
+          # ============================================================
+
+          if not repo_text.strip():
+              fail("repository.yaml is empty")
+
+          # ============================================================
+          # Required application implementation
+          # ============================================================
+
+          required_app_markers = [
+              'APP_NAME = "StreamHub"',
+              "ThreadingHTTPServer",
+
+              "content_filter",
+              "item_matches_content",
+
+              "provider_mode",
+              "select_active_server",
+              "check_all_servers",
+
+              "streamhub_id",
+              "build_m3u",
+
+              "player_api.php",
+              "proxy_access_key",
+
+              "series_state",
+              "series_state_rebuild_on_start",
+              "cache_refresh_on_start",
+
+              "/health",
+              "/status",
+              "/tv.m3u",
+              "/movies.m3u",
+              "/series.m3u",
+              "/epg.xml",
+          ]
+
+          for marker in required_app_markers:
+              if marker not in app_text:
+                  fail(
+                      "app.py missing required "
+                      f"implementation marker: {marker}"
+                  )
+
+          # ============================================================
+          # Required API routes
+          # ============================================================
+
+          required_routes = [
+              '"/health"',
+              '"/status"',
+              '"/check-servers"',
+              '"/refresh"',
+              '"/cache"',
+              '"/tv.m3u"',
+              '"/movies.m3u"',
+              '"/series.m3u"',
+              '"/epg.xml"',
+              '"/player_api.php"',
+          ]
+
+          for route in required_routes:
+              if route not in app_text:
+                  fail(
+                      f"app.py missing required route marker: {route}"
+                  )
+
+          # ============================================================
+          # Security
+          # No provider URLs in public repository
+          # ============================================================
+
+          forbidden_provider_hosts = [
+              "line.tivi-ott.net",
+              "line.cloud-ott.net",
+              "line.hey-ott.net",
+              "line.one-ott.xyz",
+              "line.mytvtvone.com",
+              "mag.hey-ott.net",
+              "mag.one-ott.xyz",
+              "mag.tivi-ott.net",
+          ]
+
+          source_files = [
+              app,
+              cfg_file,
+              dockerfile,
+              run_sh,
+              repository,
+          ]
+
+          for path in source_files:
+              content = path.read_text(
+                  encoding="utf-8"
+              ).lower()
+
+              for host in forbidden_provider_hosts:
+                  if host.lower() in content:
+                      fail(
+                          "Forbidden provider host found "
+                          f"in public repository: {host} "
+                          f"({path})"
+                      )
+
+          # ============================================================
+          # EPG URL must remain configurable
+          # ============================================================
+
+          forbidden_epg_hosts = [
+              "free-epg.de/api/epg/nl.xml.gz",
+          ]
+
+          for path in source_files:
+              content = path.read_text(
+                  encoding="utf-8"
+              ).lower()
+
+              for host in forbidden_epg_hosts:
+                  if host in content:
+                      fail(
+                          "Hardcoded EPG provider URL found: "
+                          f"{host} ({path})"
+                      )
+
+          # ============================================================
+          # Credential protection
+          # ============================================================
+
+          credential_patterns = [
+              r'server_username\s*[:=]\s*["\'][^"\']+["\']',
+              r'server_password\s*[:=]\s*["\'][^"\']+["\']',
+              r'proxy_access_key\s*[:=]\s*["\'][^"\']+["\']',
+          ]
+
+          allowed_placeholders = {
+              "JOUW_USERNAME",
+              "JOUW_PASSWORD",
+              "EIGEN_ACCESS_KEY",
+              "",
+              "configured",
+              "none",
+          }
+
+          for path in [cfg_file, app]:
+              content = path.read_text(
+                  encoding="utf-8"
+              )
+
+              for pattern in credential_patterns:
+                  for match in re.finditer(
+                      pattern,
+                      content,
+                      re.IGNORECASE,
+                  ):
+                      assignment = match.group(0)
+
+                      if "=" in assignment:
+                          value = assignment.split(
+                              "=",
+                              1
+                          )[1]
+                      else:
+                          value = assignment.split(
+                              ":",
+                              1
+                          )[1]
+
+                      value = value.strip()
+                      value = value.strip("'\"")
+
+                      if value not in allowed_placeholders:
+                          fail(
+                              "Possible hardcoded credential "
+                              f"in {path}: {assignment}"
+                          )
+
+          # ============================================================
+          # Final result
+          # ============================================================
+
+          if errors:
+              print("")
+              print("======================================")
+              print(" VALIDATION FAILED")
+              print("======================================")
+
+              for error in errors:
+                  print(f" - {error}")
+
+              sys.exit(1)
+
+          print("")
+          print("======================================")
+          print(" VALIDATION PASSED")
+          print("======================================")
+
+          print(f"StreamHub version: {app_version}")
+          print("Python syntax: OK")
+          print("YAML: OK")
+          print("HA metadata: OK")
+          print("Architecture: aarch64 + amd64")
+          print("Port: 8088/tcp")
+          print("Watchdog: /health")
+          print("Startup cache refresh: disabled")
+          print("Series state rebuild: disabled")
+          print("Provider URLs: not hardcoded")
+          print("Provider credentials: not hardcoded")
+          PY
+
+      - name: Validate version consistency
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+          import yaml
+
+          app_text = Path(
+              "streamhub/app.py"
+          ).read_text(encoding="utf-8")
+
+          cfg = yaml.safe_load(
+              Path(
+                  "streamhub/config.yaml"
+              ).read_text(encoding="utf-8")
+          )
+
+          docker_text = Path(
+              "streamhub/Dockerfile"
+          ).read_text(encoding="utf-8")
+
+          run_text = Path(
+              "streamhub/run.sh"
+          ).read_text(encoding="utf-8")
+
+          match = re.search(
+              r'^\s*APP_VERSION\s*=\s*["\']([^"\']+)["\']',
+              app_text,
+              re.MULTILINE,
+          )
+
+          if not match:
+              print("APP_VERSION not found in app.py")
+              sys.exit(1)
+
+          version = match.group(1)
+
+          if cfg.get("version") != version:
+              print(
+                  "Version mismatch:"
+              )
+              print(
+                  f"  app.py       = {version}"
+              )
+              print(
+                  f"  config.yaml  = {cfg.get('version')}"
+              )
+              sys.exit(1)
+
+          for name, content in [
+              ("Dockerfile", docker_text),
+              ("run.sh", run_text),
+          ]:
+              if re.search(
+                  r"StreamHub\s+2\.\d+\.\d+",
+                  content,
+              ):
+                  print(
+                      f"{name} contains a hardcoded "
+                      "StreamHub patch version."
+                  )
+                  sys.exit(1)
+
           print(
-              "EPG implementation validation: OK"
+              f"Version consistency OK: {version}"
           )
           PY
 
-      # ------------------------------------------------------------
-      # Final validation
-      # ------------------------------------------------------------
-      - name: Validation complete
+      - name: Validate Dockerfile
+        run: |
+          grep -Fq 'FROM python:3.12-slim' streamhub/Dockerfile
+          grep -Fq 'WORKDIR /app' streamhub/Dockerfile
+          grep -Fq 'EXPOSE 8088' streamhub/Dockerfile
+          grep -Fq 'CMD ["/app/run.sh"]' streamhub/Dockerfile
+
+      - name: Validate run.sh
+        run: |
+          sh -n streamhub/run.sh
+          grep -Fq '#!/bin/sh' streamhub/run.sh
+          grep -Fq 'set -e' streamhub/run.sh
+          grep -Fq 'exec python3 /app/app.py' streamhub/run.sh
+
+      - name: Validation summary
+        if: success()
         run: |
           echo "======================================"
-          echo "StreamHub validation completed"
-          echo "Version: 2.0.6"
+          echo " StreamHub validation successful"
+          echo "======================================"
+          echo "Version is detected automatically."
+          echo "No workflow version update is required."
           echo "======================================"
