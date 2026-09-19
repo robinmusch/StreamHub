@@ -17,7 +17,7 @@ jobs:
 
     steps:
       # ------------------------------------------------------------
-      # Checkout
+      # Checkout repository
       # ------------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -69,7 +69,7 @@ jobs:
           echo "Required files: OK"
 
       # ------------------------------------------------------------
-      # Repository metadata
+      # repository.yaml
       # ------------------------------------------------------------
       - name: Check repository.yaml
         run: |
@@ -100,7 +100,7 @@ jobs:
       # ------------------------------------------------------------
       - name: Check run.sh
         run: |
-          test -x streamhub/run.sh
+          test -f streamhub/run.sh
 
           grep -q '^#!/bin/sh$' streamhub/run.sh
           grep -q 'set -e' streamhub/run.sh
@@ -116,10 +116,12 @@ jobs:
             exit 1
           fi
 
+          sh -n streamhub/run.sh
+
           echo "run.sh validation: OK"
 
       # ------------------------------------------------------------
-      # Install YAML validation dependency
+      # YAML dependency
       # ------------------------------------------------------------
       - name: Install validation dependencies
         run: |
@@ -133,13 +135,11 @@ jobs:
         run: |
           python - <<'PY'
           import yaml
-          from pathlib import Path
 
-          path = Path("streamhub/config.yaml")
+          path = "streamhub/config.yaml"
 
-          data = yaml.safe_load(
-              path.read_text(encoding="utf-8")
-          )
+          with open(path, "r", encoding="utf-8") as f:
+              data = yaml.safe_load(f)
 
           if not isinstance(data, dict):
               raise SystemExit(
@@ -164,8 +164,7 @@ jobs:
           ]
 
           missing = [
-              key
-              for key in required
+              key for key in required
               if key not in data
           ]
 
@@ -175,32 +174,32 @@ jobs:
                   + ", ".join(missing)
               )
 
-          if data.get("name") != "StreamHub":
+          if data["name"] != "StreamHub":
               raise SystemExit(
                   "config.yaml name must be StreamHub"
               )
 
-          if data.get("slug") != "streamhub":
-              raise SystemExit(
-                  "config.yaml slug must be streamhub"
-              )
-
-          if data.get("version") != "2.0.1":
+          if data["version"] != "2.0.1":
               raise SystemExit(
                   "config.yaml version must be 2.0.1"
               )
 
-          if "aarch64" not in data.get("arch", []):
+          if data["slug"] != "streamhub":
+              raise SystemExit(
+                  "config.yaml slug must be streamhub"
+              )
+
+          if "aarch64" not in data["arch"]:
               raise SystemExit(
                   "aarch64 architecture is required"
               )
 
-          if "amd64" not in data.get("arch", []):
+          if "amd64" not in data["arch"]:
               raise SystemExit(
                   "amd64 architecture is required"
               )
 
-          if data.get("ports", {}).get("8088/tcp") != 8088:
+          if data["ports"].get("8088/tcp") != 8088:
               raise SystemExit(
                   "TCP port 8088 must be exposed"
               )
@@ -233,8 +232,7 @@ jobs:
           options = data.get("options", {})
 
           missing_options = [
-              key
-              for key in required_options
+              key for key in required_options
               if key not in options
           ]
 
@@ -247,8 +245,7 @@ jobs:
           schema = data.get("schema", {})
 
           missing_schema = [
-              key
-              for key in required_options
+              key for key in required_options
               if key not in schema
           ]
 
@@ -258,7 +255,7 @@ jobs:
                   + ", ".join(missing_schema)
               )
 
-          if options.get("content_filter") != "ALL":
+          if options["content_filter"] != "ALL":
               raise SystemExit(
                   "Default content_filter must be ALL"
               )
@@ -279,7 +276,7 @@ jobs:
           }
 
           schema_filter = str(
-              schema.get("content_filter", "")
+              schema["content_filter"]
           )
 
           for value in allowed_filters:
@@ -304,7 +301,7 @@ jobs:
           PY
 
       # ------------------------------------------------------------
-      # Default configuration values
+      # Default configuration
       # ------------------------------------------------------------
       - name: Check StreamHub defaults
         run: |
@@ -338,19 +335,23 @@ jobs:
               "epg_timeout_seconds": 30,
           }
 
-          for key, value in expected.items():
-              actual = options.get(key)
+          for key, expected_value in expected.items():
+              actual_value = options.get(key)
 
-              if actual != value:
+              if actual_value != expected_value:
                   raise SystemExit(
-                      f"{key}: expected {value!r}, got {actual!r}"
+                      f"{key}: expected "
+                      f"{expected_value!r}, "
+                      f"got {actual_value!r}"
                   )
 
-          print("StreamHub default configuration: OK")
+          print(
+              "StreamHub default configuration: OK"
+          )
           PY
 
       # ------------------------------------------------------------
-      # Public repository must contain no provider secrets
+      # Public repository secret protection
       # ------------------------------------------------------------
       - name: Check for hardcoded provider secrets
         run: |
@@ -372,29 +373,40 @@ jobs:
                   "to the public repository."
               )
 
-          if options.get("server_username", "") not in ("", None):
+          if options.get(
+              "server_username",
+              ""
+          ) not in ("", None):
               raise SystemExit(
                   "Provider username must not be committed "
                   "to the public repository."
               )
 
-          if options.get("server_password", "") not in ("", None):
+          if options.get(
+              "server_password",
+              ""
+          ) not in ("", None):
               raise SystemExit(
                   "Provider password must not be committed "
                   "to the public repository."
               )
 
-          if options.get("proxy_access_key", "") not in ("", None):
+          if options.get(
+              "proxy_access_key",
+              ""
+          ) not in ("", None):
               raise SystemExit(
                   "Proxy access key must not be committed "
                   "to the public repository."
               )
 
-          print("Hardcoded secret validation: OK")
+          print(
+              "Hardcoded secret validation: OK"
+          )
           PY
 
       # ------------------------------------------------------------
-      # Provider URL scan
+      # Provider URL protection
       # ------------------------------------------------------------
       - name: Check for provider URLs
         run: |
@@ -411,7 +423,7 @@ jobs:
           echo "Provider URL scan: OK"
 
       # ------------------------------------------------------------
-      # Content filter implementation
+      # Content filters
       # ------------------------------------------------------------
       - name: Check StreamHub content filter implementation
         run: |
@@ -436,7 +448,7 @@ jobs:
           echo "Content filter implementation validation: OK"
 
       # ------------------------------------------------------------
-      # StreamHub version
+      # Application version
       # ------------------------------------------------------------
       - name: Check StreamHub application version
         run: |
@@ -445,7 +457,7 @@ jobs:
           echo "StreamHub application version: 2.0.1"
 
       # ------------------------------------------------------------
-      # Required API routes
+      # API routes
       # ------------------------------------------------------------
       - name: Check required API routes
         run: |
@@ -492,7 +504,9 @@ jobs:
                   + ", ".join(missing)
               )
 
-          print("Required API route validation: OK")
+          print(
+              "Required API route validation: OK"
+          )
           PY
 
       # ------------------------------------------------------------
@@ -529,11 +543,13 @@ jobs:
                   + ", ".join(missing)
               )
 
-          print("Authentication implementation validation: OK")
+          print(
+              "Authentication implementation validation: OK"
+          )
           PY
 
       # ------------------------------------------------------------
-      # Provider failover
+      # Provider selection and failover
       # ------------------------------------------------------------
       - name: Check provider failover implementation
         run: |
@@ -568,11 +584,13 @@ jobs:
                   + ", ".join(missing)
               )
 
-          print("Provider failover validation: OK")
+          print(
+              "Provider failover validation: OK"
+          )
           PY
 
       # ------------------------------------------------------------
-      # Cache persistence
+      # Cache
       # ------------------------------------------------------------
       - name: Check cache persistence implementation
         run: |
@@ -605,7 +623,9 @@ jobs:
                   + ", ".join(missing)
               )
 
-          print("Cache persistence validation: OK")
+          print(
+              "Cache persistence validation: OK"
+          )
           PY
 
       # ------------------------------------------------------------
@@ -644,11 +664,13 @@ jobs:
                   + ", ".join(missing)
               )
 
-          print("EPG implementation validation: OK")
+          print(
+              "EPG implementation validation: OK"
+          )
           PY
 
       # ------------------------------------------------------------
-      # Final
+      # Final validation
       # ------------------------------------------------------------
       - name: Validation complete
         run: |
