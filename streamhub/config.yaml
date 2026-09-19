@@ -1,5 +1,5 @@
 name: StreamHub
-version: "2.0.8"
+version: "2.0.9"
 slug: "streamhub"
 description: "Multi-provider IPTV hub with Xtream API, M3U, stream proxy, EPG, persistent caching, content filtering and automatic failover."
 url: "https://github.com/robinmusch/StreamHub"
@@ -50,9 +50,6 @@ options:
   series_pause_every: 500
   series_pause_seconds: 2.0
 
-  series_state_rebuild_on_start: false
-  cache_refresh_on_start: false
-
   epg_enabled: true
   epg_url: ""
   epg_cache_hours: 6
@@ -88,9 +85,6 @@ schema:
   series_checkpoint_every: int
   series_pause_every: int
   series_pause_seconds: float
-
-  series_state_rebuild_on_start: bool
-  cache_refresh_on_start: bool
 
   epg_enabled: bool
   epg_url: str
