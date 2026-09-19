@@ -179,9 +179,9 @@ jobs:
                   "config.yaml name must be StreamHub"
               )
 
-          if data["version"] != "2.0.4":
+          if data["version"] != "2.0.6":
               raise SystemExit(
-                  "config.yaml version must be 2.0.4"
+                  "config.yaml version must be 2.0.6"
               )
 
           if data["slug"] != "streamhub":
@@ -452,9 +452,9 @@ jobs:
       # ------------------------------------------------------------
       - name: Check StreamHub application version
         run: |
-          grep -q 'APP_VERSION = "2.0.4"' streamhub/app.py
+          grep -q 'APP_VERSION = "2.0.6"' streamhub/app.py
 
-          echo "StreamHub application version: 2.0.4"
+          echo "StreamHub application version: 2.0.6"
 
       # ------------------------------------------------------------
       # API routes
@@ -676,5 +676,5 @@ jobs:
         run: |
           echo "======================================"
           echo "StreamHub validation completed"
-          echo "Version: 2.0.4"
+          echo "Version: 2.0.6"
           echo "======================================"
