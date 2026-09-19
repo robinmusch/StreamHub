@@ -1,36 +1,32 @@
 name: StreamHub
-version: "1.4.0"
-slug: streamhub
-description: IPTV StreamHub with provider selection, caching, failover, Series State and stream proxy
-url: https://github.com/robinmusch/streamhub
-startup: services
-boot: auto
-init: false
-watchdog: http://127.0.0.1:8088/status
+version: "2.0.0"
+slug: "streamhub"
+description: "Multi-provider IPTV hub with Xtream API, M3U, stream proxy, EPG, persistent caching, content filtering and automatic failover."
+url: "https://github.com/robinmusch/streamhub"
 
 arch:
   - aarch64
   - amd64
 
+startup: application
+boot: auto
+init: false
+
 ports:
   8088/tcp: 8088
 
 ports_description:
-  8088/tcp: StreamHub HTTP API
+  8088/tcp: "StreamHub HTTP API"
 
-map:
-  - type: data
-    read_only: false
+watchdog: "http://[HOST]:[PORT:8088]/health"
 
 options:
   public_host: ""
 
-  # Intentionally empty in the public repository.
   servers: []
 
   server_username: ""
   server_password: ""
-
   proxy_access_key: ""
 
   provider_mode: "AUTO"
@@ -46,7 +42,6 @@ options:
   health_check_seconds: 900
   backup_health_check_seconds: 21600
   health_timeout_seconds: 8
-
   stream_read_timeout_seconds: 30
 
   series_workers: 1
@@ -54,6 +49,8 @@ options:
 
   epg_enabled: true
   epg_url: ""
+  epg_cache_hours: 6
+  epg_timeout_seconds: 30
 
 schema:
   public_host: str
@@ -61,15 +58,14 @@ schema:
   servers:
     - str
 
-  server_username: password
+  server_username: str
   server_password: password
-
   proxy_access_key: password
 
-  provider_mode: list(AUTO|FORCED)
+  provider_mode: "list(AUTO|FORCED)"
   forced_provider_priority: int
 
-  content_filter: list(ALL|NL|BE|DE|FR|UK|US|ES|IT|PT|TR|CUSTOM)
+  content_filter: "list(ALL|NL|BE|DE|FR|UK|US|ES|IT|PT|TR|CUSTOM)"
   custom_marker: str
 
   tv_cache_hours: int
@@ -79,7 +75,6 @@ schema:
   health_check_seconds: int
   backup_health_check_seconds: int
   health_timeout_seconds: int
-
   stream_read_timeout_seconds: int
 
   series_workers: int
@@ -87,3 +82,5 @@ schema:
 
   epg_enabled: bool
   epg_url: str
+  epg_cache_hours: int
+  epg_timeout_seconds: int
