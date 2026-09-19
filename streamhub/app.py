@@ -18,7 +18,7 @@ from xml.etree import ElementTree
 
 
 APP_NAME = "StreamHub"
-APP_VERSION = "2.0.7"
+APP_VERSION = "2.0.8"
 
 HOST = "0.0.0.0"
 PORT = 8088
@@ -60,11 +60,9 @@ DEFAULT_CONFIG = {
 
     "series_workers": 1,
     "series_request_delay": 1.5,
- "cache_refresh_on_start": False,
  "series_checkpoint_every": 100,
  "series_pause_every": 500,
  "series_pause_seconds": 2.0,
- "series_state_rebuild_on_start": False,
 
     "epg_enabled": True,
     "epg_url": "",
@@ -5311,7 +5309,13 @@ class StreamHubHandler(
 # ============================================================================
 
 def startup_background_worker():
-    """Initialize providers and reuse persistent caches on startup."""
+    """
+    Initialize StreamHub without forcing full cache/state rebuilds.
+
+    Existing persistent caches are reused when fresh. Missing or stale
+    catalog caches are refreshed automatically according to their TTL.
+    Series state is rebuilt only when the state file is missing.
+    """
     LOGGER.info("Background initialization started")
 
     try:
@@ -5319,84 +5323,97 @@ def startup_background_worker():
         check_all_servers()
     except Exception as exc:
         LOGGER.error(
-            "Provider health initialization failed: %s",
+            "Provider health initialization failed: %s: %s",
             type(exc).__name__,
-        )
-
-    # Never rebuild complete Series state automatically unless explicitly enabled.
-    if CONFIG.get("series_state_rebuild_on_start", False):
-        try:
-            if CACHE_FILES["series"].exists():
-                LOGGER.info(
-                    "Series state rebuild explicitly enabled; "
-                    "processing existing cache"
-                )
-                update_series_state_from_cache()
-        except Exception as exc:
-            LOGGER.warning(
-                "Unable to initialize series state: %s",
-                type(exc).__name__,
-            )
-    else:
-        LOGGER.info(
-            "Skipping full Series state rebuild at startup "
-            "(series_state_rebuild_on_start=false)"
+            exc,
         )
 
     try:
         ensure_epg_cache()
     except Exception as exc:
         LOGGER.warning(
-            "EPG prewarm failed: %s",
+            "EPG initialization failed: %s: %s",
             type(exc).__name__,
+            exc,
         )
 
-    # TV, Movies and Series are persistent caches. On normal startup we reuse
-    # them instead of downloading the entire catalogue again. A missing cache
-    # is still built automatically. Full refresh remains available through the
-    # existing manual refresh endpoint.
-    if CONFIG.get("cache_refresh_on_start", False):
-        LOGGER.info(
-            "Full cache refresh explicitly enabled at startup"
-        )
-        try:
-            refresh_all_caches()
-        except Exception as exc:
-            LOGGER.error(
-                "Background cache refresh failed: %s",
-                type(exc).__name__,
-            )
-        return
+    try:
+        refresh_needed = []
 
-    LOGGER.info(
-        "Startup cache policy: reuse existing TV/Movies/Series caches"
-    )
+        for cache_type in ("tv", "movies", "series"):
+            cache_path = CACHE_FILES[cache_type]
 
-    for cache_type in ("tv", "movies", "series"):
-        cache_path = CACHE_FILES[cache_type]
+            if not cache_path.exists():
+                LOGGER.info(
+                    "No existing %s cache found; building it now",
+                    cache_type,
+                )
+                refresh_needed.append(cache_type)
+                continue
 
-        if cache_path.exists():
+            try:
+                fresh = cache_is_fresh(cache_type)
+            except Exception as exc:
+                LOGGER.warning(
+                    "Unable to determine %s cache age: %s: %s",
+                    cache_type,
+                    type(exc).__name__,
+                    exc,
+                )
+                fresh = False
+
+            if fresh:
+                LOGGER.info("Using existing fresh %s cache", cache_type)
+            else:
+                LOGGER.info(
+                    "Existing %s cache is stale; refreshing it",
+                    cache_type,
+                )
+                refresh_needed.append(cache_type)
+
+        for cache_type in refresh_needed:
+            try:
+                refresh_cache_type(cache_type)
+            except Exception as exc:
+                LOGGER.error(
+                    "Automatic %s cache refresh failed: %s: %s",
+                    cache_type,
+                    type(exc).__name__,
+                    exc,
+                    exc_info=True,
+                )
+
+        # Only create Series state when it does not exist yet.
+        # A normal restart reuses the existing state and does not rescan
+        # thousands of Series/episodes.
+        series_cache = CACHE_FILES["series"]
+        state_path = BASE_DIR / "series_state.json"
+
+        if series_cache.exists() and not state_path.exists():
             LOGGER.info(
-                "Using existing %s cache: %s",
-                cache_type,
-                cache_path,
+                "Series state missing; performing one-time Series state build"
             )
-            continue
+            try:
+                update_series_state_from_cache()
+            except Exception as exc:
+                LOGGER.error(
+                    "Initial Series state build failed: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                    exc_info=True,
+                )
+        elif state_path.exists():
+            LOGGER.info("Existing Series state found; reusing it")
 
-        LOGGER.info(
-            "No existing %s cache found; building it now",
-            cache_type,
+    except Exception as exc:
+        LOGGER.error(
+            "Automatic startup cache policy failed: %s: %s",
+            type(exc).__name__,
+            exc,
+            exc_info=True,
         )
 
-        try:
-            refresh_cache_type(cache_type)
-        except Exception as exc:
-            LOGGER.error(
-                "Initial %s cache build failed: %s",
-                cache_type,
-                type(exc).__name__,
-            )
-
+    LOGGER.info("Background initialization completed")
 
 def start_server():
     ensure_directories()
