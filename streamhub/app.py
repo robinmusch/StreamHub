@@ -2806,7 +2806,7 @@ def build_series_cache():
     checkpoint_path = CACHE_FILES["series"].with_name(
         "series_build_checkpoint.json"
     )
-    checkpoint = load_json(checkpoint_path, default={}) or {}
+    checkpoint = read_json_file(checkpoint_path) or {}
 
     if int(checkpoint.get("provider_priority", priority)) != priority:
         checkpoint = {}
