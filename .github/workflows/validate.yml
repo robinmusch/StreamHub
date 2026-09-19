@@ -179,9 +179,9 @@ jobs:
                   "config.yaml name must be StreamHub"
               )
 
-          if data["version"] != "2.0.1":
+          if data["version"] != "2.0.2":
               raise SystemExit(
-                  "config.yaml version must be 2.0.1"
+                  "config.yaml version must be 2.0.2"
               )
 
           if data["slug"] != "streamhub":
