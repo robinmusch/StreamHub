@@ -1,5 +1,5 @@
 name: StreamHub
-version: "3.0.0"
+version: "3.0.1"
 slug: "streamhub"
 description: "Single Xtream login for multiple IPTV providers with health checks, automatic failover, stream proxy and EPG passthrough."
 url: "https://github.com/robinmusch/StreamHub"
