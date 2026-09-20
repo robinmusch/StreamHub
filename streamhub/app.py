@@ -12,7 +12,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 APP_NAME = "StreamHub"
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.0.1"
 HOST = "0.0.0.0"
 PORT = 8088
 OPTIONS_FILE = Path("/data/options.json")
@@ -117,10 +117,17 @@ def public_base(request):
     return f"{proto if proto in ('http', 'https') else 'http'}://{host}".rstrip("/")
 
 
-def authorized(query):
+def authorized(query, path=""):
     key = proxy_password()
     if not key:
         return True
+    # TiviMate may use the normal Xtream playback URL:
+    # /live/<username>/<password>/<stream_id>.ts
+    # In that case credentials are part of the path, not the query string.
+    parts = [urllib.parse.unquote(x) for x in path.strip("/").split("/") if x]
+    if len(parts) >= 4 and parts[0] in {"live", "movie", "series"}:
+        if parts[1] == proxy_username() and parts[2] == key:
+            return True
     return (
         query.get("key", [""])[0] == key
         or (
@@ -389,19 +396,21 @@ def upstream_stream_url(server, kind, source_id, extension):
 
 def stream_url(request, kind, item):
     base = public_base(request)
-    key = urllib.parse.urlencode({"key": proxy_password()}) if proxy_password() else ""
+    route = "live" if kind == "tv" else "movie" if kind == "movies" else "series"
     sid = str(item.get("stream_id") or item.get("series_id") or "")
     ext = "ts" if kind == "tv" else str(item.get("container_extension", "ts") or "ts").lstrip(".")
-    return f"{base}/{'live' if kind == 'tv' else 'movie' if kind == 'movies' else 'series'}/{urllib.parse.quote(sid, safe='')}.{ext}" + (f"?{key}" if key else "")
+    user = urllib.parse.quote(proxy_username(), safe="")
+    password = urllib.parse.quote(proxy_password(), safe="")
+    return f"{base}/{route}/{user}/{password}/{urllib.parse.quote(sid, safe='')}.{ext}"
 
 
 def series_direct_url(request, series, episode):
     base = public_base(request)
-    params = {"key": proxy_password(), "sid": series.get("series_id", ""), "s": episode.get("season", 0), "e": episode.get("episode_num", 0), "t": episode.get("title", "")}
-    params = {k: v for k, v in params.items() if v != ""}
+    user = urllib.parse.quote(proxy_username(), safe="")
+    password = urllib.parse.quote(proxy_password(), safe="")
     eid = str(episode.get("id", ""))
     ext = str(episode.get("container_extension", "ts") or "ts").lstrip(".")
-    return f"{base}/series/{urllib.parse.quote(eid, safe='')}.{ext}?{urllib.parse.urlencode(params)}"
+    return f"{base}/series/{user}/{password}/{urllib.parse.quote(eid, safe='')}.{ext}"
 
 
 def xtream_profile(request):
@@ -618,7 +627,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             send_json(self, 200, {"status": "ok", "application": APP_NAME, "version": APP_VERSION})
             return
-        if not authorized(query):
+        if not authorized(query, path):
             send_json(self, 401, {"status": "error", "error": "unauthorized"})
             return
         if path == "/status":
