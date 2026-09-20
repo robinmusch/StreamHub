@@ -19,7 +19,7 @@ from xml.etree import ElementTree
 
 
 APP_NAME = "StreamHub"
-APP_VERSION = "2.1.7"
+APP_VERSION = "2.1.8"
 
 HOST = "0.0.0.0"
 PORT = 8088
@@ -3998,47 +3998,92 @@ def resolve_stream_source(cache_type, item, server, priority):
 
         elif cache_type == "series":
             series_item, episode = item
-            series_list = fetch_xtream_action(server, "get_series")
-            target_series = find_provider_series_match(series_list, series_item)
-            if not target_series or target_series.get("series_id") is None:
-                return None
 
-            details = fetch_xtream_action(
-                server,
-                "get_series_info",
-                {"series_id": target_series["series_id"]},
+            # The cached Series detail response already contains the provider
+            # episode ID. Use it directly when the active provider is the
+            # provider that produced the cache. This avoids an unnecessary
+            # get_series + get_series_info round-trip every time an episode
+            # starts.
+            cached_priority = safe_int(
+                series_item.get("provider_priority", 0),
+                0,
             )
+            episode_provider_id = episode.get("id")
 
-            target_season = safe_int(episode.get("season", 0), 0)
-            target_episode_num = safe_int(episode.get("episode_num", 0), 0)
-            target_title = normalize_identity_text(episode.get("title", ""))
+            if (
+                episode_provider_id is not None
+                and cached_priority == priority
+            ):
+                source = {
+                    "stream_id": str(episode_provider_id),
+                    "container_extension": stream_extension(
+                        episode,
+                        "mp4",
+                    ),
+                }
+            else:
+                # Provider failover can change Xtream stream IDs. In that
+                # case resolve the same series/episode against the new
+                # provider using season + episode number + title.
+                series_list = fetch_xtream_action(
+                    server,
+                    "get_series",
+                )
+                target_series = find_provider_series_match(
+                    series_list,
+                    series_item,
+                )
+                if not target_series or target_series.get("series_id") is None:
+                    return None
 
-            matches = []
-            for candidate in flatten_provider_episodes(details.get("episodes", {})):
-                if safe_int(candidate.get("season", 0), 0) != target_season:
-                    continue
-                if safe_int(candidate.get("episode_num", 0), 0) != target_episode_num:
-                    continue
-                matches.append(candidate)
+                details = fetch_xtream_action(
+                    server,
+                    "get_series_info",
+                    {"series_id": target_series["series_id"]},
+                )
 
-            if target_title:
-                titled = [
-                    candidate
-                    for candidate in matches
-                    if normalize_identity_text(candidate.get("title", "")) == target_title
-                ]
-                matches = titled or matches
+                target_season = safe_int(
+                    episode.get("season", 0),
+                    0,
+                )
+                target_episode_num = safe_int(
+                    episode.get("episode_num", 0),
+                    0,
+                )
+                target_title = normalize_identity_text(
+                    episode.get("title", ""),
+                )
 
-            if not matches or matches[0].get("id") is None:
-                return None
+                matches = []
+                for candidate in flatten_provider_episodes(
+                    details.get("episodes", {})
+                ):
+                    if safe_int(candidate.get("season", 0), 0) != target_season:
+                        continue
+                    if safe_int(candidate.get("episode_num", 0), 0) != target_episode_num:
+                        continue
+                    matches.append(candidate)
 
-            source = {
-                "stream_id": str(matches[0]["id"]),
-                "container_extension": stream_extension(
-                    matches[0],
-                    stream_extension(episode, "mp4"),
-                ),
-            }
+                if target_title:
+                    titled = [
+                        candidate
+                        for candidate in matches
+                        if normalize_identity_text(
+                            candidate.get("title", "")
+                        ) == target_title
+                    ]
+                    matches = titled or matches
+
+                if not matches or matches[0].get("id") is None:
+                    return None
+
+                source = {
+                    "stream_id": str(matches[0]["id"]),
+                    "container_extension": stream_extension(
+                        matches[0],
+                        stream_extension(episode, "mp4"),
+                    ),
+                }
         else:
             return None
 
