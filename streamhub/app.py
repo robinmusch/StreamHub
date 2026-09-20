@@ -19,7 +19,7 @@ from xml.etree import ElementTree
 
 
 APP_NAME = "StreamHub"
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.1.2"
 
 HOST = "0.0.0.0"
 PORT = 8088
@@ -915,28 +915,19 @@ def write_cache_metadata(
 
 
 def cache_item_count(cache_type, metadata=None):
-    """Count items incrementally when an older cache has no metadata sidecar."""
+    """Return the stored item count without scanning a large cache file.
+
+    Older caches may not have a metadata sidecar. In that case return None
+    rather than parsing/scanning the cache during status requests. This keeps
+    /status and startup lightweight and prevents a status poll from creating
+    avoidable disk/CPU pressure while streams are active.
+    """
     if isinstance(metadata, dict):
         stored_count = metadata.get("items")
         if isinstance(stored_count, int):
             return stored_count
 
-    path = CACHE_FILES[cache_type]
-    if not path.exists():
-        return 0
-
-    try:
-        return sum(
-            1
-            for _ in iter_json_array_items(path)
-        )
-    except Exception as exc:
-        LOGGER.warning(
-            "Unable to count %s cache items: %s",
-            cache_type,
-            exc,
-        )
-        return 0
+    return None
 
 
 def cache_is_fresh(cache_type):
@@ -968,7 +959,7 @@ def cache_status(cache_type):
             "exists": CACHE_FILES[cache_type].exists(),
             "fresh": False,
             "age_seconds": None,
-            "items": 0,
+            "items": None,
         }
 
     age = cache_age_seconds(
