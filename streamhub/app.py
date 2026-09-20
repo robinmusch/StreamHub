@@ -19,14 +19,13 @@ from xml.etree import ElementTree
 
 
 APP_NAME = "StreamHub"
-APP_VERSION = "2.0.14"
+APP_VERSION = "2.1.0"
 
 HOST = "0.0.0.0"
 PORT = 8088
 
 OPTIONS_FILE = Path("/data/options.json")
 CACHE_DIR = Path("/data/cache")
-SERIES_STATE_FILE = Path("/data/series_state.json")
 PROVIDER_STATE_FILE = Path("/data/provider_state.json")
 SOURCE_RESOLUTION_FILE = Path("/data/source_resolution.json")
 EPG_CACHE_FILE = CACHE_DIR / "epg.xml"
@@ -561,51 +560,13 @@ def iter_json_array_items(path):
 # SERIES STATE
 # ============================================================================
 
-def default_series_state():
-    return {
-        "version": 1,
-        "updated_at": now_unix(),
-        "watchlist": [],
-        "series": {},
-    }
 
 
-def load_series_state():
-    payload = read_json_file(
-        SERIES_STATE_FILE
-    )
-
-    if not isinstance(payload, dict):
-        payload = default_series_state()
-
-    if not isinstance(
-        payload.get("watchlist"),
-        list,
-    ):
-        payload["watchlist"] = []
-
-    if not isinstance(
-        payload.get("series"),
-        dict,
-    ):
-        payload["series"] = {}
-
-    if "version" not in payload:
-        payload["version"] = 1
-
-    return payload
 
 
-def save_series_state(state):
-    state["updated_at"] = now_unix()
-
-    atomic_write_json(
-        SERIES_STATE_FILE,
-        state,
-    )
 
 
-def series_state_key(item):
+def series_id_key(item):
     """
     Provider-onafhankelijke serie-ID.
 
@@ -647,11 +608,11 @@ def series_state_key(item):
     ).hexdigest()[:20]
 
 
-def episode_state_key(
+def episode_id_key(
     series_item,
     episode,
 ):
-    series_id = series_state_key(
+    series_id = series_id_key(
         series_item
     )
 
@@ -816,403 +777,14 @@ def flatten_series_episodes(
     return result
 
 
-def update_series_state_from_cache():
-    """
-    Vergelijkt de huidige Series-cache met de permanente state.
 
-    Nieuwe episodes worden als new=true opgeslagen.
-    Bestaande watched-status blijft behouden.
-    """
 
-    state = load_series_state()
 
-    series_items = iter_json_array_items(
-        CACHE_FILES["series"]
-    )
 
-    current_series_keys = set()
-    processed = 0
 
-    LOGGER.info("Rebuilding Series state from persistent cache")
 
-    for series_item in series_items:
-        processed += 1
-        if processed % 250 == 0:
-            LOGGER.info("Series state: %d item(s) processed", processed)
-        if not isinstance(
-            series_item,
-            dict,
-        ):
-            continue
 
-        series_key = series_state_key(
-            series_item
-        )
 
-        current_series_keys.add(
-            series_key
-        )
-
-        series_name = catalog_name(
-            series_item
-        )
-
-        existing = state[
-            "series"
-        ].get(
-            series_key,
-            {},
-        )
-
-        if not isinstance(
-            existing,
-            dict,
-        ):
-            existing = {}
-
-        existing["name"] = series_name
-
-        existing["category"] = (
-            catalog_category_name(
-                series_item
-            )
-        )
-
-        existing.setdefault(
-            "watching",
-            False,
-        )
-
-        existing.setdefault(
-            "watched_episodes",
-            [],
-        )
-
-        existing.setdefault(
-            "episodes",
-            {},
-        )
-
-        existing.setdefault(
-            "new_episodes",
-            [],
-        )
-
-        known_episodes = existing[
-            "episodes"
-        ]
-
-        if not isinstance(
-            known_episodes,
-            dict,
-        ):
-            known_episodes = {}
-
-        new_episode_ids = set(
-            existing.get(
-                "new_episodes",
-                [],
-            )
-        )
-
-        for episode in flatten_series_episodes(
-            series_item
-        ):
-            episode_key = episode_state_key(
-                series_item,
-                episode,
-            )
-
-            label = episode_label(
-                episode
-            )
-
-            was_known = (
-                episode_key
-                in known_episodes
-            )
-
-            known_episodes[
-                episode_key
-            ] = {
-                "label": label,
-                "season": safe_int(
-                    episode.get(
-                        "season",
-                        0,
-                    ),
-                    0,
-                ),
-                "episode": safe_int(
-                    episode.get(
-                        "episode_num",
-                        0,
-                    ),
-                    0,
-                ),
-                "title": str(
-                    episode.get(
-                        "title",
-                        "",
-                    )
-                    or ""
-                ),
-                "first_seen": known_episodes.get(
-                    episode_key,
-                    {},
-                ).get(
-                    "first_seen",
-                    now_unix(),
-                ),
-                "last_seen": now_unix(),
-                "watched": (
-                    episode_key
-                    in set(
-                        existing.get(
-                            "watched_episodes",
-                            [],
-                        )
-                    )
-                ),
-            }
-
-            if (
-                not was_known
-                and episode_key
-                not in set(
-                    existing.get(
-                        "watched_episodes",
-                        [],
-                    )
-                )
-            ):
-                new_episode_ids.add(
-                    episode_key
-                )
-
-        existing["episodes"] = (
-            known_episodes
-        )
-
-        existing["new_episodes"] = sorted(
-            new_episode_ids
-        )
-
-        state[
-            "series"
-        ][series_key] = existing
-
-    save_series_state(
-        state
-    )
-
-    LOGGER.info("Series state rebuilt: %d item(s)", processed)
-
-    return state
-
-
-def watchlist_series():
-    state = load_series_state()
-
-    result = []
-
-    for series_key in state[
-        "watchlist"
-    ]:
-        item = state[
-            "series"
-        ].get(
-            series_key
-        )
-
-        if item:
-            result.append(
-                {
-                    "series_id": series_key,
-                    **item,
-                }
-            )
-
-    return result
-
-
-def new_episode_list():
-    state = load_series_state()
-
-    result = []
-
-    for series_key, series in state[
-        "series"
-    ].items():
-
-        if not series.get(
-            "watching",
-            False,
-        ):
-            continue
-
-        for episode_key in series.get(
-            "new_episodes",
-            [],
-        ):
-            episode = series.get(
-                "episodes",
-                {},
-            ).get(
-                episode_key
-            )
-
-            if not episode:
-                continue
-
-            result.append(
-                {
-                    "series_id": series_key,
-                    "episode_id": episode_key,
-                    "series_name": series.get(
-                        "name",
-                        "",
-                    ),
-                    **episode,
-                }
-            )
-
-    result.sort(
-        key=lambda item: (
-            item.get(
-                "first_seen",
-                0,
-            ),
-            item.get(
-                "series_name",
-                "",
-            ).casefold(),
-        ),
-        reverse=True,
-    )
-
-    return result
-
-
-def set_series_watching(
-    series_id,
-    enabled,
-):
-    state = load_series_state()
-
-    series = state[
-        "series"
-    ].get(
-        series_id
-    )
-
-    if series is None:
-        return False
-
-    series["watching"] = bool(
-        enabled
-    )
-
-    watchlist = set(
-        state.get(
-            "watchlist",
-            [],
-        )
-    )
-
-    if enabled:
-        watchlist.add(
-            series_id
-        )
-    else:
-        watchlist.discard(
-            series_id
-        )
-
-    state[
-        "watchlist"
-    ] = sorted(
-        watchlist
-    )
-
-    save_series_state(
-        state
-    )
-
-    return True
-
-
-def mark_episode_watched(
-    series_id,
-    episode_id,
-    watched=True,
-):
-    state = load_series_state()
-
-    series = state[
-        "series"
-    ].get(
-        series_id
-    )
-
-    if not series:
-        return False
-
-    watched_ids = set(
-        series.get(
-            "watched_episodes",
-            [],
-        )
-    )
-
-    new_ids = set(
-        series.get(
-            "new_episodes",
-            [],
-        )
-    )
-
-    if watched:
-        watched_ids.add(
-            episode_id
-        )
-        new_ids.discard(
-            episode_id
-        )
-    else:
-        watched_ids.discard(
-            episode_id
-        )
-
-    series[
-        "watched_episodes"
-    ] = sorted(
-        watched_ids
-    )
-
-    series[
-        "new_episodes"
-    ] = sorted(
-        new_ids
-    )
-
-    episode = series.get(
-        "episodes",
-        {},
-    ).get(
-        episode_id
-    )
-
-    if episode:
-        episode["watched"] = bool(
-            watched
-        )
-
-    save_series_state(
-        state
-    )
-
-    return True
 
 
 # ============================================================================
@@ -2899,14 +2471,6 @@ def build_series_cache():
     if written <= 0:
         raise RuntimeError("no_series_details")
 
-    try:
-        update_series_state_from_cache()
-    except Exception as exc:
-        LOGGER.warning(
-            "Series state rebuild failed after cache build: %s: %s",
-            type(exc).__name__,
-            exc,
-        )
 
     LOGGER.info(
         "Series cache written: %d item(s) including episode details",
@@ -3208,7 +2772,7 @@ def streamhub_episode_url(
         request
     )
 
-    episode_id = episode_state_key(
+    episode_id = episode_id_key(
         series_item,
         episode,
     )
@@ -3561,7 +3125,7 @@ def xtream_vod_item(
 
 
 def xtream_series_item(item):
-    series_id = series_state_key(
+    series_id = series_id_key(
         item
     )
 
@@ -3635,7 +3199,7 @@ def find_cached_item(
         cache_type
     ):
         if cache_type == "series":
-            current_id = series_state_key(
+            current_id = series_id_key(
                 item
             )
         else:
@@ -3669,7 +3233,7 @@ def transform_series_info(
             0,
         )
 
-        episode_id = episode_state_key(
+        episode_id = episode_id_key(
             series_item,
             episode,
         )
@@ -3719,52 +3283,6 @@ def transform_series_info(
             request,
             series_item,
             episode,
-        )
-
-        output[
-            "_streamhub_new"
-        ] = (
-            episode_id
-            in set(
-                load_series_state()
-                .get(
-                    "series",
-                    {}
-                )
-                .get(
-                    series_state_key(
-                        series_item
-                    ),
-                    {},
-                )
-                .get(
-                    "new_episodes",
-                    [],
-                )
-            )
-        )
-
-        output[
-            "_streamhub_watched"
-        ] = (
-            episode_id
-            in set(
-                load_series_state()
-                .get(
-                    "series",
-                    {}
-                )
-                .get(
-                    series_state_key(
-                        series_item
-                    ),
-                    {},
-                )
-                .get(
-                    "watched_episodes",
-                    [],
-                )
-            )
         )
 
         episodes_by_season.setdefault(
@@ -3889,12 +3407,6 @@ def player_api_response(
                 "seasons": [],
             }
 
-        state = load_series_state()
-        series_state = state.get("series", {}).get(
-            series_state_key(item),
-            {},
-        )
-
         detailed_item = dict(item)
         detailed_item["info"] = details.get("info", {})
         detailed_item["episodes"] = details.get("episodes", {})
@@ -3907,18 +3419,6 @@ def player_api_response(
                 detailed_item,
             ),
             "seasons": details.get("seasons", []),
-            "_streamhub": {
-                "watching": series_state.get(
-                    "watching",
-                    False,
-                ),
-                "new_episode_count": len(
-                    series_state.get(
-                        "new_episodes",
-                        [],
-                    )
-                ),
-            },
         }
 
     if action == "get_vod_info":
@@ -4178,7 +3678,7 @@ def find_provider_series_match(items, target_series):
 def find_cached_episode(episode_id):
     for series_item in load_cache_items("series"):
         for episode in flatten_series_episodes(series_item):
-            if episode_state_key(series_item, episode) == str(episode_id):
+            if episode_id_key(series_item, episode) == str(episode_id):
                 return series_item, episode
     return None, None
 
@@ -4186,7 +3686,7 @@ def find_cached_episode(episode_id):
 def resolve_stream_source(cache_type, item, server, priority):
     """Resolve a provider-specific source for a provider-independent StreamHub ID."""
     item_id = (
-        episode_state_key(item[0], item[1])
+        episode_id_key(item[0], item[1])
         if cache_type == "series"
         else streamhub_id(cache_type, item)
     )
@@ -4866,17 +4366,6 @@ class StreamHubHandler(
                             else None
                         ),
                     },
-                    "series_state": {
-                        "watchlist_count": len(
-                            load_series_state().get(
-                                "watchlist",
-                                [],
-                            )
-                        ),
-                        "new_episode_count": len(
-                            new_episode_list()
-                        ),
-                    },
                     "refresh": {
                         "running": STATE[
                             "refresh_running"
@@ -5078,178 +4567,6 @@ class StreamHubHandler(
                 self.wfile.write(body)
             return
 
-        # ------------------------------------------------------------
-        # SERIES STATE
-        # ------------------------------------------------------------
-
-        if path == "/series-state":
-            send_json(
-                self,
-                200,
-                load_series_state(),
-            )
-            return
-
-        if path == "/watchlist":
-            send_json(
-                self,
-                200,
-                {
-                    "series": watchlist_series(),
-                    "count": len(
-                        watchlist_series()
-                    ),
-                },
-            )
-            return
-
-        if path == "/new-episodes":
-            send_json(
-                self,
-                200,
-                {
-                    "episodes": (
-                        new_episode_list()
-                    ),
-                    "count": len(
-                        new_episode_list()
-                    ),
-                },
-            )
-            return
-
-        # ------------------------------------------------------------
-        # WATCHLIST ACTIONS
-        # ------------------------------------------------------------
-
-        if path == "/watchlist/add":
-            series_id = query.get(
-                "series_id",
-                [""],
-            )[0]
-
-            if set_series_watching(
-                series_id,
-                True,
-            ):
-                send_json(
-                    self,
-                    200,
-                    {
-                        "status": "ok",
-                        "watching": True,
-                        "series_id": series_id,
-                    },
-                )
-            else:
-                send_json(
-                    self,
-                    404,
-                    {
-                        "status": "error",
-                        "error": (
-                            "series_not_found"
-                        ),
-                    },
-                )
-
-            return
-
-        if path == "/watchlist/remove":
-            series_id = query.get(
-                "series_id",
-                [""],
-            )[0]
-
-            if set_series_watching(
-                series_id,
-                False,
-            ):
-                send_json(
-                    self,
-                    200,
-                    {
-                        "status": "ok",
-                        "watching": False,
-                        "series_id": series_id,
-                    },
-                )
-            else:
-                send_json(
-                    self,
-                    404,
-                    {
-                        "status": "error",
-                        "error": (
-                            "series_not_found"
-                        ),
-                    },
-                )
-
-            return
-
-        # ------------------------------------------------------------
-        # EPISODE WATCHED
-        # ------------------------------------------------------------
-
-        if path == "/episode/watched":
-            series_id = query.get(
-                "series_id",
-                [""],
-            )[0]
-
-            episode_id = query.get(
-                "episode_id",
-                [""],
-            )[0]
-
-            watched_value = query.get(
-                "watched",
-                ["1"],
-            )[0]
-
-            watched = (
-                watched_value
-                not in {
-                    "0",
-                    "false",
-                    "False",
-                    "no",
-                }
-            )
-
-            success = mark_episode_watched(
-                series_id,
-                episode_id,
-                watched,
-            )
-
-            if success:
-                send_json(
-                    self,
-                    200,
-                    {
-                        "status": "ok",
-                        "series_id": series_id,
-                        "episode_id": episode_id,
-                        "watched": watched,
-                    },
-                )
-            else:
-                send_json(
-                    self,
-                    404,
-                    {
-                        "status": "error",
-                        "error": (
-                            "series_or_episode_not_found"
-                        ),
-                    },
-                )
-
-            return
-
-        # ------------------------------------------------------------
         # XTREAM API
         # ------------------------------------------------------------
 
@@ -5333,11 +4650,10 @@ class StreamHubHandler(
 
 def startup_background_worker():
     """
-    Initialize StreamHub without forcing full cache/state rebuilds.
+    Initialize StreamHub without forcing unnecessary full rebuilds.
 
     Fresh persistent caches are reused. Missing or stale catalog caches are
-    refreshed automatically according to their configured TTL. Series state
-    is rebuilt only when a Series cache exists and the state is still empty.
+    refreshed automatically according to their configured TTL.
     """
     LOGGER.info("Background initialization started")
 
@@ -5409,43 +4725,6 @@ def startup_background_worker():
                     exc_info=True,
                 )
 
-        # start_server() creates an empty default state file when needed.
-        # A file existing is therefore not enough to prove usable state.
-        series_cache = CACHE_FILES["series"]
-
-        if series_cache.exists():
-            try:
-                state = load_series_state()
-                series_records = state.get("series", {})
-                state_has_series = (
-                    isinstance(series_records, dict)
-                    and bool(series_records)
-                )
-            except Exception as exc:
-                LOGGER.warning(
-                    "Unable to inspect Series state: %s: %s",
-                    type(exc).__name__,
-                    exc,
-                    exc_info=True,
-                )
-                state_has_series = False
-
-            if state_has_series:
-                LOGGER.info("Existing Series state found; reusing it")
-            else:
-                LOGGER.info(
-                    "Series state is empty; performing one-time "
-                    "Series state build"
-                )
-                try:
-                    update_series_state_from_cache()
-                except Exception as exc:
-                    LOGGER.error(
-                        "Initial Series state build failed: %s: %s",
-                        type(exc).__name__,
-                        exc,
-                        exc_info=True,
-                    )
 
     except Exception as exc:
         LOGGER.error(
@@ -5460,10 +4739,6 @@ def startup_background_worker():
 def start_server():
     ensure_directories()
 
-    if not SERIES_STATE_FILE.exists():
-        save_series_state(
-            default_series_state()
-        )
 
     if not PROVIDER_STATE_FILE.exists():
         save_provider_control(
@@ -5499,10 +4774,6 @@ def start_server():
         CACHE_DIR,
     )
 
-    LOGGER.info(
-        "Persistent series state: %s",
-        SERIES_STATE_FILE,
-    )
 
     filter_info = (
         content_filter_description()
