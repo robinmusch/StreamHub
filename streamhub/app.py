@@ -19,7 +19,7 @@ from xml.etree import ElementTree
 
 
 APP_NAME = "StreamHub"
-APP_VERSION = "2.1.5"
+APP_VERSION = "2.1.7"
 
 HOST = "0.0.0.0"
 PORT = 8088
@@ -3141,10 +3141,11 @@ def build_m3u(
                         # for series grouping. Standard M3U itself has no
                         # native series/season hierarchy.
                         attributes = [
-                            'tvg-type="series"',
+                            'tvg-type="serie"',
                             f'tvg-name="{m3u_escape(display_name)}"',
                             f'tvg-series="{m3u_escape(series_name)}"',
                             f'tvg-series-id="{m3u_escape(series_id)}"',
+                            f'serie-title="{m3u_escape(series_name)}"',
                             f'tvg-season="{m3u_escape(season)}"',
                             f'tvg-episode="{m3u_escape(episode_num)}"',
                             f'group-title="{m3u_escape(category)}"',
@@ -4870,42 +4871,40 @@ class StreamHubHandler(
         if path in playlist_types:
             cache_type = playlist_types[path]
 
-            if cache_type == "series":
-                try:
-                    series_m3u = build_series_m3u_file(
-                        self
-                    )
-                    send_file_stream(
-                        self,
-                        series_m3u,
-                        "audio/x-mpegurl; charset=utf-8",
-                    )
-                except Exception as exc:
-                    LOGGER.error(
-                        "Unable to build Series M3U: %s: %s",
-                        type(exc).__name__,
-                        exc,
-                        exc_info=True,
-                    )
-                    send_json(
-                        self,
-                        500,
-                        {
-                            "status": "error",
-                            "error": "series_m3u_generation_failed",
-                        },
-                    )
-                return
-
-            send_text(
-                self,
-                200,
-                build_m3u(
+            try:
+                playlist_path = build_m3u(
                     self,
                     cache_type,
-                ),
-                "audio/x-mpegurl; charset=utf-8",
-            )
+                )
+                if isinstance(playlist_path, Path):
+                    send_file_stream(
+                        self,
+                        playlist_path,
+                        "audio/x-mpegurl; charset=utf-8",
+                    )
+                else:
+                    send_text(
+                        self,
+                        200,
+                        playlist_path,
+                        "audio/x-mpegurl; charset=utf-8",
+                    )
+            except Exception as exc:
+                LOGGER.error(
+                    "Unable to build %s M3U: %s: %s",
+                    cache_type,
+                    type(exc).__name__,
+                    exc,
+                    exc_info=True,
+                )
+                send_json(
+                    self,
+                    500,
+                    {
+                        "status": "error",
+                        "error": f"{cache_type}_m3u_generation_failed",
+                    },
+                )
             return
 
         # ------------------------------------------------------------
