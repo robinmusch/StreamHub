@@ -19,7 +19,7 @@ from xml.etree import ElementTree
 
 
 APP_NAME = "StreamHub"
-APP_VERSION = "2.1.9"
+APP_VERSION = "2.1.10"
 
 HOST = "0.0.0.0"
 PORT = 8088
@@ -796,24 +796,33 @@ def load_cache_items(cache_type):
         CACHE_FILES[cache_type]
     )
 
-    if not isinstance(
-        payload,
-        dict,
-    ):
+    if not isinstance(payload, dict):
         return []
 
-    items = payload.get(
-        "items",
-        [],
-    )
+    items = payload.get("items", [])
 
-    if not isinstance(
-        items,
-        list,
-    ):
+    if not isinstance(items, list):
         return []
 
     return items
+
+
+def iter_cache_items(cache_type):
+    """Yield cache items without loading the complete catalog into RAM."""
+    path = CACHE_FILES.get(cache_type)
+
+    if path is None or not path.exists():
+        return
+
+    try:
+        yield from iter_json_array_items(path)
+    except Exception as exc:
+        LOGGER.warning(
+            "Unable to stream %s cache: %s",
+            cache_type,
+            exc,
+        )
+
 
 
 def cache_age_seconds(payload):
@@ -2971,14 +2980,10 @@ def build_m3u(
 def api_category_list(
     cache_type,
 ):
-    items = load_cache_items(
-        cache_type
-    )
-
     categories = {}
     used = set()
 
-    for item in items:
+    for item in iter_cache_items(cache_type):
         category_id = (
             catalog_category_id(
                 item
@@ -3015,13 +3020,9 @@ def api_stream_list(
     cache_type,
     category_id=None,
 ):
-    items = load_cache_items(
-        cache_type
-    )
-
     result = []
 
-    for item in items:
+    for item in iter_cache_items(cache_type):
         item_category_id = (
             catalog_category_id(
                 item
@@ -3218,7 +3219,7 @@ def find_cached_item(
     if not item_id:
         return None
 
-    for item in load_cache_items(
+    for item in iter_cache_items(
         cache_type
     ):
         if cache_type == "series":
