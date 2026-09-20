@@ -1,7 +1,7 @@
 name: StreamHub
-version: "2.1.12"
+version: "3.0.0"
 slug: "streamhub"
-description: "Multi-provider IPTV hub with Xtream API, M3U, stream proxy, EPG, persistent caching, content filtering and automatic failover."
+description: "Single Xtream login for multiple IPTV providers with health checks, automatic failover, stream proxy and EPG passthrough."
 url: "https://github.com/robinmusch/StreamHub"
 
 arch:
@@ -16,17 +16,16 @@ ports:
   8088/tcp: 8088
 
 ports_description:
-  8088/tcp: "StreamHub HTTP API"
+  8088/tcp: "StreamHub Xtream API"
 
 watchdog: "http://[HOST]:[PORT:8088]/health"
 
 options:
   public_host: ""
-
   servers: []
-
   server_username: ""
   server_password: ""
+  proxy_username: "streamhub"
   proxy_access_key: ""
 
   provider_mode: "AUTO"
@@ -35,34 +34,22 @@ options:
   content_filter: "ALL"
   custom_marker: ""
 
-  tv_cache_hours: 24
-  movies_cache_hours: 12
-  series_cache_hours: 12
-
   health_check_seconds: 900
   backup_health_check_seconds: 21600
   health_timeout_seconds: 8
   stream_read_timeout_seconds: 30
 
-  series_workers: 1
-  series_request_delay: 1.5
-  series_checkpoint_every: 100
-  series_pause_every: 500
-  series_pause_seconds: 2.0
-
   epg_enabled: true
   epg_url: ""
-  epg_cache_hours: 6
   epg_timeout_seconds: 30
 
 schema:
   public_host: str
-
   servers:
     - str
-
   server_username: str
   server_password: password
+  proxy_username: str
   proxy_access_key: password
 
   provider_mode: "list(AUTO|FORCED)"
@@ -71,22 +58,11 @@ schema:
   content_filter: "list(ALL|NL|BE|DE|FR|UK|US|ES|IT|PT|TR|CUSTOM)"
   custom_marker: str
 
-  tv_cache_hours: int
-  movies_cache_hours: int
-  series_cache_hours: int
-
   health_check_seconds: int
   backup_health_check_seconds: int
   health_timeout_seconds: int
   stream_read_timeout_seconds: int
 
-  series_workers: int
-  series_request_delay: float
-  series_checkpoint_every: int
-  series_pause_every: int
-  series_pause_seconds: float
-
   epg_enabled: bool
   epg_url: str
-  epg_cache_hours: int
   epg_timeout_seconds: int
