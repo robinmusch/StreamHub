@@ -19,7 +19,7 @@ from xml.etree import ElementTree
 
 
 APP_NAME = "StreamHub"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 
 HOST = "0.0.0.0"
 PORT = 8088
@@ -34,6 +34,13 @@ CACHE_FILES = {
     "tv": CACHE_DIR / "tv.json",
     "movies": CACHE_DIR / "movies.json",
     "series": CACHE_DIR / "series.json",
+}
+
+# Lightweight cache metadata. This avoids parsing large Series JSON into RAM
+# for startup freshness checks and Home Assistant status polling.
+CACHE_META_FILES = {
+    cache_type: CACHE_DIR / f"{cache_type}.meta.json"
+    for cache_type in CACHE_FILES
 }
 
 
@@ -839,19 +846,107 @@ def cache_age_seconds(payload):
     )
 
 
-def cache_is_fresh(cache_type):
-    payload = read_json_file(
-        CACHE_FILES[cache_type]
+def read_cache_metadata(cache_type):
+    """Read cache metadata without decoding the complete items array."""
+    meta_path = CACHE_META_FILES[cache_type]
+    cache_path = CACHE_FILES[cache_type]
+
+    if meta_path.exists():
+        try:
+            with meta_path.open("r", encoding="utf-8") as file:
+                metadata = json.load(file)
+            if isinstance(metadata, dict):
+                return metadata
+        except Exception as exc:
+            LOGGER.warning(
+                "Unable to read cache metadata %s: %s",
+                meta_path,
+                exc,
+            )
+
+    if not cache_path.exists():
+        return None
+
+    try:
+        with cache_path.open("r", encoding="utf-8") as file:
+            prefix = file.read(131072)
+
+        marker = prefix.find('"items"')
+        if marker < 0:
+            return None
+
+        header = prefix[:marker].rstrip()
+        if header.endswith(","):
+            header = header[:-1]
+
+        metadata = json.loads(header + "}")
+        if not isinstance(metadata, dict):
+            return None
+
+        return metadata
+    except Exception as exc:
+        LOGGER.warning(
+            "Unable to read cache header %s: %s",
+            cache_path,
+            exc,
+        )
+        return None
+
+
+def write_cache_metadata(
+    cache_type,
+    created_at,
+    provider_priority,
+    item_count,
+):
+    metadata = {
+        "version": 1,
+        "type": cache_type,
+        "created_at": created_at,
+        "provider_priority": provider_priority,
+        "content_filter": content_filter_description(),
+        "items": int(item_count),
+    }
+
+    atomic_write_json(
+        CACHE_META_FILES[cache_type],
+        metadata,
     )
 
-    if not isinstance(
-        payload,
-        dict,
-    ):
+
+def cache_item_count(cache_type, metadata=None):
+    """Count items incrementally when an older cache has no metadata sidecar."""
+    if isinstance(metadata, dict):
+        stored_count = metadata.get("items")
+        if isinstance(stored_count, int):
+            return stored_count
+
+    path = CACHE_FILES[cache_type]
+    if not path.exists():
+        return 0
+
+    try:
+        return sum(
+            1
+            for _ in iter_json_array_items(path)
+        )
+    except Exception as exc:
+        LOGGER.warning(
+            "Unable to count %s cache items: %s",
+            cache_type,
+            exc,
+        )
+        return 0
+
+
+def cache_is_fresh(cache_type):
+    metadata = read_cache_metadata(cache_type)
+
+    if not isinstance(metadata, dict):
         return False
 
     age = cache_age_seconds(
-        payload
+        metadata
     )
 
     if age is None:
@@ -866,28 +961,18 @@ def cache_is_fresh(cache_type):
 
 
 def cache_status(cache_type):
-    payload = read_json_file(
-        CACHE_FILES[cache_type]
-    )
+    metadata = read_cache_metadata(cache_type)
 
-    if not isinstance(
-        payload,
-        dict,
-    ):
+    if not isinstance(metadata, dict):
         return {
-            "exists": False,
+            "exists": CACHE_FILES[cache_type].exists(),
             "fresh": False,
             "age_seconds": None,
             "items": 0,
         }
 
-    items = payload.get(
-        "items",
-        [],
-    )
-
     age = cache_age_seconds(
-        payload
+        metadata
     )
 
     return {
@@ -904,25 +989,20 @@ def cache_status(cache_type):
             if age is not None
             else None
         ),
-        "items": (
-            len(items)
-            if isinstance(
-                items,
-                list,
-            )
-            else 0
+        "items": cache_item_count(
+            cache_type,
+            metadata,
         ),
-        "created_at": payload.get(
+        "created_at": metadata.get(
             "created_at"
         ),
-        "provider_priority": payload.get(
+        "provider_priority": metadata.get(
             "provider_priority"
         ),
-        "content_filter": payload.get(
+        "content_filter": metadata.get(
             "content_filter"
         ),
     }
-
 
 def write_cache(
     cache_type,
@@ -947,6 +1027,13 @@ def write_cache(
         payload,
     )
 
+    write_cache_metadata(
+        cache_type,
+        payload["created_at"],
+        provider_priority,
+        len(items),
+    )
+
 
 def write_series_cache_streaming(items, provider_priority):
     """Write Series cache incrementally so the complete catalog stays off-RAM."""
@@ -957,13 +1044,14 @@ def write_series_cache_streaming(items, provider_priority):
         f".{path.name}.{os.getpid()}.{threading.get_ident()}.building"
     )
     written = 0
+    created_at = now_unix()
 
     try:
         with temporary.open("w", encoding="utf-8") as file:
             file.write("{")
             file.write('"version":2,')
             file.write('"type":"series",')
-            file.write(f'"created_at":{now_unix()},')
+            file.write(f'"created_at":{created_at},')
             file.write(
                 '"provider_priority":'
                 + json.dumps(provider_priority)
@@ -1004,6 +1092,13 @@ def write_series_cache_streaming(items, provider_priority):
             os.fsync(file.fileno())
 
         os.replace(temporary, path)
+
+        write_cache_metadata(
+            "series",
+            created_at,
+            provider_priority,
+            written,
+        )
 
     finally:
         try:
@@ -2477,6 +2572,11 @@ def build_series_cache():
         written,
     )
 
+    # Release the catalogue and temporary provider payloads immediately.
+    del series_items
+    del seen
+    gc.collect()
+
     return written
 
 def refresh_cache_type(cache_type):
@@ -2532,6 +2632,9 @@ def refresh_all_caches():
                 refresh_cache_type(
                     cache_type
                 )
+
+                # Reclaim temporary objects before the next cache type.
+                gc.collect()
 
             except Exception as exc:
                 errors.append(
