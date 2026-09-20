@@ -19,7 +19,7 @@ from xml.etree import ElementTree
 
 
 APP_NAME = "StreamHub"
-APP_VERSION = "2.1.3"
+APP_VERSION = "2.1.5"
 
 HOST = "0.0.0.0"
 PORT = 8088
@@ -2997,7 +2997,14 @@ def iter_cache_items_streaming(cache_type, chunk_size=131072):
 
 
 def build_series_m3u_file(request):
-    """Build Series M3U directly to disk so TiviMate never causes a huge RAM allocation."""
+    """
+    Build the legacy Series catalog M3U.
+
+    The old StreamHub exposed one M3U entry per Series, not one entry per
+    episode. This keeps the playlist small and prevents TiviMate from seeing
+    every episode as a movie-like item. Seasons/episodes are supplied through
+    the Xtream player_api.php get_series_info endpoint.
+    """
     path = CACHE_DIR / "series.m3u"
     temporary = CACHE_DIR / (
         f".series.m3u.{os.getpid()}.{threading.get_ident()}.building"
@@ -3013,33 +3020,34 @@ def build_series_m3u_file(request):
             for series in iter_cache_items_streaming("series"):
                 series_name = catalog_name(series)
                 category = catalog_category_name(series)
+                series_id = series_id_key(series)
 
-                for episode in flatten_series_episodes(series):
-                    label = episode_label(episode)
-                    display_name = f"{series_name} - {label}"
+                if not series_id:
+                    continue
 
-                    file.write(
-                        "#EXTINF:-1 "
-                        f'tvg-name="{m3u_escape(display_name)}" '
-                        f'group-title="{m3u_escape(category)}",'
-                        f"{m3u_escape(display_name)}\n"
+                file.write(
+                    "#EXTINF:-1 "
+                    f'tvg-name="{m3u_escape(series_name)}" '
+                    f'tvg-logo="{m3u_escape(series.get("cover", ""))}" '
+                    f'group-title="{m3u_escape(category)}",'
+                    f"{m3u_escape(series_name)}\n"
+                )
+                file.write(
+                    streamhub_url_for_item(
+                        request,
+                        "series",
+                        series,
                     )
-                    file.write(
-                        streamhub_episode_url(
-                            request,
-                            series,
-                            episode,
-                        )
-                        + "\n"
-                    )
-                    written += 1
+                    + "\n"
+                )
+                written += 1
 
             file.flush()
             os.fsync(file.fileno())
 
         os.replace(temporary, path)
         LOGGER.info(
-            "Series M3U generated: %d episode(s), %d bytes",
+            "Series M3U generated: %d series, %d bytes",
             written,
             path.stat().st_size,
         )
@@ -3087,122 +3095,153 @@ def build_m3u(
     request,
     cache_type,
 ):
-    items = load_cache_items(
-        cache_type
-    )
+    # Series are emitted as episodes, but with explicit series/season/episode
+    # metadata. This is an M3U-only compatibility mode for players that
+    # understand extended series attributes. The playlist remains streamed
+    # from the disk-backed cache and is not assembled as one giant string.
+    if cache_type == "series":
+        path = CACHE_DIR / "series.m3u"
+        temporary = CACHE_DIR / (
+            f".series.m3u.{os.getpid()}.{threading.get_ident()}.building"
+        )
+        written = 0
+
+        try:
+            with temporary.open("w", encoding="utf-8") as file:
+                file.write("#EXTM3U\n")
+                file.write(f'# StreamHub-Version="{APP_VERSION}"\n')
+
+                for series in iter_cache_items_streaming("series"):
+                    series_name = catalog_name(series)
+                    category = catalog_category_name(series)
+                    series_id = series_id_key(series)
+
+                    if not series_id:
+                        continue
+
+                    for episode in flatten_series_episodes(series):
+                        label = episode_label(episode)
+                        season = (
+                            episode.get("season")
+                            or episode.get("season_num")
+                            or episode.get("season_number")
+                            or 0
+                        )
+                        episode_num = (
+                            episode.get("episode_num")
+                            or episode.get("episode_number")
+                            or episode.get("episode")
+                            or 0
+                        )
+
+                        # Keep the human-readable name conventional.
+                        display_name = f"{series_name} - {label}"
+
+                        # Extended M3U attributes used by some IPTV players
+                        # for series grouping. Standard M3U itself has no
+                        # native series/season hierarchy.
+                        attributes = [
+                            'tvg-type="series"',
+                            f'tvg-name="{m3u_escape(display_name)}"',
+                            f'tvg-series="{m3u_escape(series_name)}"',
+                            f'tvg-series-id="{m3u_escape(series_id)}"',
+                            f'tvg-season="{m3u_escape(season)}"',
+                            f'tvg-episode="{m3u_escape(episode_num)}"',
+                            f'group-title="{m3u_escape(category)}"',
+                        ]
+
+                        logo = str(
+                            series.get("cover")
+                            or series.get("cover_big")
+                            or ""
+                        ).strip()
+                        if logo:
+                            attributes.append(
+                                f'tvg-logo="{m3u_escape(logo)}"'
+                            )
+
+                        file.write(
+                            "#EXTINF:-1 "
+                            + " ".join(attributes)
+                            + ","
+                            + m3u_escape(display_name)
+                            + "\n"
+                        )
+                        file.write(
+                            streamhub_episode_url(
+                                request,
+                                series,
+                                episode,
+                            )
+                            + "\n"
+                        )
+                        written += 1
+
+                file.flush()
+                os.fsync(file.fileno())
+
+            os.replace(temporary, path)
+            LOGGER.info(
+                "Series M3U generated: %d episodes, %d bytes",
+                written,
+                path.stat().st_size,
+            )
+            return path
+
+        finally:
+            try:
+                if temporary.exists():
+                    temporary.unlink()
+            except OSError:
+                pass
+
+    items = load_cache_items(cache_type)
 
     lines = [
         "#EXTM3U",
-        (
-            f'# StreamHub-Version="{APP_VERSION}"'
-        ),
+        f'# StreamHub-Version="{APP_VERSION}"',
     ]
 
-    if cache_type != "series":
-        for item in items:
-            name = m3u_escape(
-                catalog_name(item)
+    for item in items:
+        name = m3u_escape(catalog_name(item))
+        category = m3u_escape(catalog_category_name(item))
+        logo = str(
+            item.get("stream_icon", "")
+            or item.get("cover", "")
+            or ""
+        ).strip()
+        tvg_id = str(
+            item.get("epg_channel_id", "")
+            or item.get("epg_id", "")
+            or ""
+        ).strip()
+
+        attributes = [
+            f'tvg-id="{m3u_escape(tvg_id)}"',
+            f'tvg-name="{name}"',
+            f'group-title="{category}"',
+        ]
+
+        if logo:
+            attributes.append(
+                f'tvg-logo="{m3u_escape(logo)}"'
             )
 
-            category = m3u_escape(
-                catalog_category_name(
-                    item
-                )
+        lines.append(
+            "#EXTINF:-1 "
+            + " ".join(attributes)
+            + ","
+            + name
+        )
+        lines.append(
+            streamhub_url_for_item(
+                request,
+                cache_type,
+                item,
             )
+        )
 
-            logo = str(
-                item.get(
-                    "stream_icon",
-                    "",
-                )
-                or item.get(
-                    "cover",
-                    "",
-                )
-                or ""
-            ).strip()
-
-            tvg_id = str(
-                item.get(
-                    "epg_channel_id",
-                    "",
-                )
-                or item.get(
-                    "epg_id",
-                    "",
-                )
-                or ""
-            ).strip()
-
-            attributes = [
-                f'tvg-id="{m3u_escape(tvg_id)}"',
-                f'tvg-name="{name}"',
-                f'group-title="{category}"',
-            ]
-
-            if logo:
-                attributes.append(
-                    f'tvg-logo="{m3u_escape(logo)}"'
-                )
-
-            lines.append(
-                "#EXTINF:-1 "
-                + " ".join(
-                    attributes
-                )
-                + ","
-                + name
-            )
-
-            lines.append(
-                streamhub_url_for_item(
-                    request,
-                    cache_type,
-                    item,
-                )
-            )
-
-    else:
-        for series in items:
-            series_name = catalog_name(
-                series
-            )
-
-            category = catalog_category_name(
-                series
-            )
-
-            for episode in flatten_series_episodes(
-                series
-            ):
-                label = episode_label(
-                    episode
-                )
-
-                display_name = (
-                    f"{series_name} - "
-                    f"{label}"
-                )
-
-                lines.append(
-                    "#EXTINF:-1 "
-                    f'tvg-name="{m3u_escape(display_name)}" '
-                    f'group-title="{m3u_escape(category)}",'
-                    f"{m3u_escape(display_name)}"
-                )
-
-                lines.append(
-                    streamhub_episode_url(
-                        request,
-                        series,
-                        episode,
-                    )
-                )
-
-    return (
-        "\n".join(lines)
-        + "\n"
-    )
+    return "\n".join(lines) + "\n"
 
 
 # ============================================================================
@@ -3212,71 +3251,64 @@ def build_m3u(
 def api_category_list(
     cache_type,
 ):
-    items = load_cache_items(
-        cache_type
+    source = (
+        iter_cache_items_streaming(cache_type)
+        if cache_type == "series"
+        else load_cache_items(cache_type)
     )
 
     categories = {}
     used = set()
 
-    for item in items:
-        category_id = (
-            catalog_category_id(
-                item
-            )
-        )
-
-        category_name = (
-            catalog_category_name(
-                item
-            )
-        )
+    for item in source:
+        category_id = catalog_category_id(item)
+        category_name = catalog_category_name(item)
 
         if category_id in used:
             continue
 
-        used.add(
-            category_id
-        )
-
-        categories[
-            category_id
-        ] = {
+        used.add(category_id)
+        categories[category_id] = {
             "category_id": category_id,
             "category_name": category_name,
             "parent_id": 0,
         }
 
-    return list(
-        categories.values()
-    )
+    return list(categories.values())
 
 
 def api_stream_list(
     cache_type,
     category_id=None,
 ):
-    items = load_cache_items(
-        cache_type
+    source = (
+        iter_cache_items_streaming(cache_type)
+        if cache_type == "series"
+        else load_cache_items(cache_type)
     )
 
     result = []
 
-    for item in items:
-        item_category_id = (
-            catalog_category_id(
-                item
-            )
-        )
+    for item in source:
+        item_category_id = catalog_category_id(item)
 
         if (
             category_id is not None
-            and str(category_id)
-            != str(item_category_id)
+            and str(category_id) != str(item_category_id)
         ):
             continue
 
-        result.append(item)
+        if cache_type == "series":
+            # Do not return the cached episode payload in the catalog response.
+            # TiviMate only needs the series-level metadata here; episode data
+            # is supplied by get_series_info.
+            result.append({
+                key: value
+                for key, value in item.items()
+                if key not in ("episodes", "info", "seasons")
+            })
+        else:
+            result.append(item)
 
     return result
 
@@ -3459,22 +3491,19 @@ def find_cached_item(
     if not item_id:
         return None
 
-    for item in load_cache_items(
-        cache_type
-    ):
-        if cache_type == "series":
-            current_id = series_id_key(
-                item
-            )
-        else:
-            current_id = streamhub_id(
-                cache_type,
-                item,
-            )
+    items = (
+        iter_cache_items_streaming(cache_type)
+        if cache_type == "series"
+        else load_cache_items(cache_type)
+    )
 
-        if current_id == str(
-            item_id
-        ):
+    for item in items:
+        if cache_type == "series":
+            current_id = series_id_key(item)
+        else:
+            current_id = streamhub_id(cache_type, item)
+
+        if current_id == str(item_id):
             return item
 
     return None
@@ -3629,10 +3658,7 @@ def player_api_response(
         ]
 
     if action == "get_series_info":
-        series_id = query.get(
-            "series_id",
-            [None],
-        )[0]
+        series_id = query.get("series_id", [None])[0]
 
         item = find_cached_item(
             "series",
@@ -3646,43 +3672,25 @@ def player_api_response(
                 "seasons": [],
             }
 
-        server, priority = get_active_provider_snapshot()
-        if not server:
-            return {
-                "info": {},
-                "episodes": {},
-                "seasons": [],
-            }
+        # The Series cache already contains the full episode detail payload.
+        # Do not contact the provider when TiviMate opens a series. This keeps
+        # Series browsing provider-independent and avoids another expensive
+        # get_series_info request for every series the user opens.
+        info = item.get("info", {})
+        if not isinstance(info, dict):
+            info = {}
 
-        # Series details are deliberately fetched only when the client opens
-        # a specific series. This keeps the startup/catalog refresh small and
-        # prevents thousands of episode payloads from accumulating in RAM.
-        details = fetch_series_detail(
-            server,
-            priority,
-            item,
-            0,
-        )
-
-        if not details:
-            return {
-                "info": {},
-                "episodes": {},
-                "seasons": [],
-            }
-
-        detailed_item = dict(item)
-        detailed_item["info"] = details.get("info", {})
-        detailed_item["episodes"] = details.get("episodes", {})
-        detailed_item["seasons"] = details.get("seasons", [])
+        seasons = item.get("seasons", [])
+        if not isinstance(seasons, list):
+            seasons = []
 
         return {
-            "info": details.get("info", {}),
+            "info": info,
             "episodes": transform_series_info(
                 request,
-                detailed_item,
+                item,
             ),
-            "seasons": details.get("seasons", []),
+            "seasons": seasons,
         }
 
     if action == "get_vod_info":
@@ -3940,10 +3948,14 @@ def find_provider_series_match(items, target_series):
 
 
 def find_cached_episode(episode_id):
-    for series_item in load_cache_items("series"):
+    if not episode_id:
+        return None, None
+
+    for series_item in iter_cache_items_streaming("series"):
         for episode in flatten_series_episodes(series_item):
             if episode_id_key(series_item, episode) == str(episode_id):
                 return series_item, episode
+
     return None, None
 
 
