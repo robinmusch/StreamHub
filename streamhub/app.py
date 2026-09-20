@@ -19,7 +19,11 @@ from xml.etree import ElementTree
 
 
 APP_NAME = "StreamHub"
-APP_VERSION = "2.1.10"
+APP_VERSION = "2.1.11"
+
+# Cache schema: Series cache v3 is intentionally incompatible with the old
+# episode-heavy cache so TiviMate never receives the legacy payload.
+SERIES_CACHE_SCHEMA = 3
 
 HOST = "0.0.0.0"
 PORT = 8088
@@ -848,41 +852,60 @@ def cache_age_seconds(payload):
     )
 
 
-def cache_is_fresh(cache_type):
-    payload = read_json_file(
-        CACHE_FILES[cache_type]
-    )
+def read_cache_header(cache_type):
+    """Read only the cache header; never json.load the complete catalog."""
+    path = CACHE_FILES[cache_type]
 
-    if not isinstance(
-        payload,
-        dict,
-    ):
+    if not path.exists():
+        return None
+
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            raw = file.read(131072)
+
+        marker = raw.find('"items"')
+        if marker >= 0:
+            raw = raw[:marker] + "} }"
+
+        decoder = json.JSONDecoder()
+        payload, _ = decoder.raw_decode(raw)
+        return payload if isinstance(payload, dict) else None
+    except Exception as exc:
+        LOGGER.warning(
+            "Unable to read %s cache header: %s",
+            cache_type,
+            type(exc).__name__,
+        )
+        return None
+
+
+def cache_schema_valid(cache_type, payload):
+    if not isinstance(payload, dict):
         return False
 
-    age = cache_age_seconds(
-        payload
-    )
+    if cache_type == "series":
+        return safe_int(payload.get("version", 0), 0) >= SERIES_CACHE_SCHEMA
 
+    return safe_int(payload.get("version", 0), 0) >= 2
+
+
+def cache_is_fresh(cache_type):
+    payload = read_cache_header(cache_type)
+
+    if not cache_schema_valid(cache_type, payload):
+        return False
+
+    age = cache_age_seconds(payload)
     if age is None:
         return False
 
-    return (
-        age
-        <= cache_ttl_seconds(
-            cache_type
-        )
-    )
+    return age <= cache_ttl_seconds(cache_type)
 
 
 def cache_status(cache_type):
-    payload = read_json_file(
-        CACHE_FILES[cache_type]
-    )
+    payload = read_cache_header(cache_type)
 
-    if not isinstance(
-        payload,
-        dict,
-    ):
+    if not isinstance(payload, dict):
         return {
             "exists": False,
             "fresh": False,
@@ -890,46 +913,28 @@ def cache_status(cache_type):
             "items": 0,
         }
 
-    items = payload.get(
-        "items",
-        [],
-    )
+    age = cache_age_seconds(payload)
+    valid = cache_schema_valid(cache_type, payload)
 
-    age = cache_age_seconds(
-        payload
-    )
+    # Item count is intentionally omitted here for the large Series cache.
+    # Counting it would require scanning the complete JSON array.
+    item_count = payload.get("item_count")
+    if not isinstance(item_count, int):
+        item_count = None
 
     return {
         "exists": True,
         "fresh": (
-            age is not None
-            and age
-            <= cache_ttl_seconds(
-                cache_type
-            )
+            valid
+            and age is not None
+            and age <= cache_ttl_seconds(cache_type)
         ),
-        "age_seconds": (
-            round(age, 1)
-            if age is not None
-            else None
-        ),
-        "items": (
-            len(items)
-            if isinstance(
-                items,
-                list,
-            )
-            else 0
-        ),
-        "created_at": payload.get(
-            "created_at"
-        ),
-        "provider_priority": payload.get(
-            "provider_priority"
-        ),
-        "content_filter": payload.get(
-            "content_filter"
-        ),
+        "schema_valid": valid,
+        "age_seconds": round(age, 1) if age is not None else None,
+        "items": item_count,
+        "created_at": payload.get("created_at"),
+        "provider_priority": payload.get("provider_priority"),
+        "content_filter": payload.get("content_filter"),
     }
 
 
@@ -970,7 +975,7 @@ def write_series_cache_streaming(items, provider_priority):
     try:
         with temporary.open("w", encoding="utf-8") as file:
             file.write("{")
-            file.write('"version":2,')
+            file.write(f'"version":{SERIES_CACHE_SCHEMA},')
             file.write('"type":"series",')
             file.write(f'"created_at":{now_unix()},')
             file.write(
@@ -3700,7 +3705,7 @@ def find_provider_series_match(items, target_series):
 
 
 def find_cached_episode(episode_id):
-    for series_item in load_cache_items("series"):
+    for series_item in iter_cache_items("series"):
         for episode in flatten_series_episodes(series_item):
             if episode_id_key(series_item, episode) == str(episode_id):
                 return series_item, episode
@@ -4732,9 +4737,18 @@ def startup_background_worker():
                 LOGGER.info("Using existing fresh %s cache", cache_type)
             else:
                 LOGGER.info(
-                    "Existing %s cache is stale; refreshing it",
+                    "Existing %s cache is stale or incompatible; refreshing it",
                     cache_type,
                 )
+                if cache_type == "series":
+                    try:
+                        cache_path.unlink(missing_ok=True)
+                        LOGGER.info("Removed incompatible legacy Series cache")
+                    except OSError as exc:
+                        LOGGER.warning(
+                            "Unable to remove legacy Series cache: %s",
+                            type(exc).__name__,
+                        )
                 refresh_needed.append(cache_type)
 
         for cache_type in refresh_needed:
