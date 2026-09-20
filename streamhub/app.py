@@ -19,7 +19,7 @@ from xml.etree import ElementTree
 
 
 APP_NAME = "StreamHub"
-APP_VERSION = "2.1.8"
+APP_VERSION = "2.1.9"
 
 HOST = "0.0.0.0"
 PORT = 8088
@@ -34,13 +34,6 @@ CACHE_FILES = {
     "tv": CACHE_DIR / "tv.json",
     "movies": CACHE_DIR / "movies.json",
     "series": CACHE_DIR / "series.json",
-}
-
-# Lightweight cache metadata. This avoids parsing large Series JSON into RAM
-# for startup freshness checks and Home Assistant status polling.
-CACHE_META_FILES = {
-    cache_type: CACHE_DIR / f"{cache_type}.meta.json"
-    for cache_type in CACHE_FILES
 }
 
 
@@ -846,98 +839,19 @@ def cache_age_seconds(payload):
     )
 
 
-def read_cache_metadata(cache_type):
-    """Read cache metadata without decoding the complete items array."""
-    meta_path = CACHE_META_FILES[cache_type]
-    cache_path = CACHE_FILES[cache_type]
-
-    if meta_path.exists():
-        try:
-            with meta_path.open("r", encoding="utf-8") as file:
-                metadata = json.load(file)
-            if isinstance(metadata, dict):
-                return metadata
-        except Exception as exc:
-            LOGGER.warning(
-                "Unable to read cache metadata %s: %s",
-                meta_path,
-                exc,
-            )
-
-    if not cache_path.exists():
-        return None
-
-    try:
-        with cache_path.open("r", encoding="utf-8") as file:
-            prefix = file.read(131072)
-
-        marker = prefix.find('"items"')
-        if marker < 0:
-            return None
-
-        header = prefix[:marker].rstrip()
-        if header.endswith(","):
-            header = header[:-1]
-
-        metadata = json.loads(header + "}")
-        if not isinstance(metadata, dict):
-            return None
-
-        return metadata
-    except Exception as exc:
-        LOGGER.warning(
-            "Unable to read cache header %s: %s",
-            cache_path,
-            exc,
-        )
-        return None
-
-
-def write_cache_metadata(
-    cache_type,
-    created_at,
-    provider_priority,
-    item_count,
-):
-    metadata = {
-        "version": 1,
-        "type": cache_type,
-        "created_at": created_at,
-        "provider_priority": provider_priority,
-        "content_filter": content_filter_description(),
-        "items": int(item_count),
-    }
-
-    atomic_write_json(
-        CACHE_META_FILES[cache_type],
-        metadata,
+def cache_is_fresh(cache_type):
+    payload = read_json_file(
+        CACHE_FILES[cache_type]
     )
 
-
-def cache_item_count(cache_type, metadata=None):
-    """Return the stored item count without scanning a large cache file.
-
-    Older caches may not have a metadata sidecar. In that case return None
-    rather than parsing/scanning the cache during status requests. This keeps
-    /status and startup lightweight and prevents a status poll from creating
-    avoidable disk/CPU pressure while streams are active.
-    """
-    if isinstance(metadata, dict):
-        stored_count = metadata.get("items")
-        if isinstance(stored_count, int):
-            return stored_count
-
-    return None
-
-
-def cache_is_fresh(cache_type):
-    metadata = read_cache_metadata(cache_type)
-
-    if not isinstance(metadata, dict):
+    if not isinstance(
+        payload,
+        dict,
+    ):
         return False
 
     age = cache_age_seconds(
-        metadata
+        payload
     )
 
     if age is None:
@@ -952,18 +866,28 @@ def cache_is_fresh(cache_type):
 
 
 def cache_status(cache_type):
-    metadata = read_cache_metadata(cache_type)
+    payload = read_json_file(
+        CACHE_FILES[cache_type]
+    )
 
-    if not isinstance(metadata, dict):
+    if not isinstance(
+        payload,
+        dict,
+    ):
         return {
-            "exists": CACHE_FILES[cache_type].exists(),
+            "exists": False,
             "fresh": False,
             "age_seconds": None,
-            "items": None,
+            "items": 0,
         }
 
+    items = payload.get(
+        "items",
+        [],
+    )
+
     age = cache_age_seconds(
-        metadata
+        payload
     )
 
     return {
@@ -980,20 +904,25 @@ def cache_status(cache_type):
             if age is not None
             else None
         ),
-        "items": cache_item_count(
-            cache_type,
-            metadata,
+        "items": (
+            len(items)
+            if isinstance(
+                items,
+                list,
+            )
+            else 0
         ),
-        "created_at": metadata.get(
+        "created_at": payload.get(
             "created_at"
         ),
-        "provider_priority": metadata.get(
+        "provider_priority": payload.get(
             "provider_priority"
         ),
-        "content_filter": metadata.get(
+        "content_filter": payload.get(
             "content_filter"
         ),
     }
+
 
 def write_cache(
     cache_type,
@@ -1018,13 +947,6 @@ def write_cache(
         payload,
     )
 
-    write_cache_metadata(
-        cache_type,
-        payload["created_at"],
-        provider_priority,
-        len(items),
-    )
-
 
 def write_series_cache_streaming(items, provider_priority):
     """Write Series cache incrementally so the complete catalog stays off-RAM."""
@@ -1035,14 +957,13 @@ def write_series_cache_streaming(items, provider_priority):
         f".{path.name}.{os.getpid()}.{threading.get_ident()}.building"
     )
     written = 0
-    created_at = now_unix()
 
     try:
         with temporary.open("w", encoding="utf-8") as file:
             file.write("{")
             file.write('"version":2,')
             file.write('"type":"series",')
-            file.write(f'"created_at":{created_at},')
+            file.write(f'"created_at":{now_unix()},')
             file.write(
                 '"provider_priority":'
                 + json.dumps(provider_priority)
@@ -1083,25 +1004,6 @@ def write_series_cache_streaming(items, provider_priority):
             os.fsync(file.fileno())
 
         os.replace(temporary, path)
-
-        # The episode playlist is derived from series.json and must never
-        # survive a cache replacement.
-        series_m3u_path = CACHE_DIR / "series.m3u"
-        try:
-            if series_m3u_path.exists():
-                series_m3u_path.unlink()
-        except OSError as exc:
-            LOGGER.warning(
-                "Unable to invalidate Series M3U cache: %s",
-                exc,
-            )
-
-        write_cache_metadata(
-            "series",
-            created_at,
-            provider_priority,
-            written,
-        )
 
     finally:
         try:
@@ -2085,6 +1987,7 @@ def normalize_item(
     cache_type,
     category_name,
     provider_priority,
+    category_id=None,
 ):
     if not isinstance(
         item,
@@ -2103,6 +2006,11 @@ def normalize_item(
         ),
         "category_name": (
             category_name
+        ),
+        "category_id": (
+            str(category_id)
+            if category_id is not None
+            else ""
         ),
         "cached_at": now_unix(),
     }
@@ -2220,6 +2128,7 @@ def build_tv_cache():
                 "tv",
                 category_name,
                 priority,
+                category_id,
             )
 
             if normalized:
@@ -2303,6 +2212,7 @@ def build_movies_cache():
                 "movies",
                 category_name,
                 priority,
+                category_id,
             )
 
             if normalized:
@@ -2420,6 +2330,7 @@ def build_series_cache():
                 "series",
                 category_name,
                 priority,
+                category_id,
             )
 
             if not normalized:
@@ -2575,11 +2486,6 @@ def build_series_cache():
         written,
     )
 
-    # Release the catalogue and temporary provider payloads immediately.
-    del series_items
-    del seen
-    gc.collect()
-
     return written
 
 def refresh_cache_type(cache_type):
@@ -2635,9 +2541,6 @@ def refresh_all_caches():
                 refresh_cache_type(
                     cache_type
                 )
-
-                # Reclaim temporary objects before the next cache type.
-                gc.collect()
 
             except Exception as exc:
                 errors.append(
@@ -2774,6 +2677,20 @@ def catalog_category_name(item):
 
 
 def catalog_category_id(item):
+    stored = str(
+        item.get(
+            "_streamhub",
+        ).get(
+            "category_id",
+            "",
+        )
+        if isinstance(item.get("_streamhub"), dict)
+        else ""
+    ).strip()
+
+    if stored:
+        return stored
+
     category = normalize_identity_text(
         catalog_category_name(item)
     )
@@ -2925,324 +2842,126 @@ def m3u_escape(value):
     )
 
 
-
-def iter_cache_items_streaming(cache_type, chunk_size=131072):
-    """Yield cache items one JSON object at a time without loading the cache into RAM."""
-    path = CACHE_FILES[cache_type]
-
-    if not path.exists():
-        return
-
-    decoder = json.JSONDecoder()
-    buffer = ""
-    items_started = False
-
-    with path.open("r", encoding="utf-8") as file:
-        while True:
-            if not items_started:
-                chunk = file.read(chunk_size)
-                if not chunk:
-                    raise ValueError("invalid_cache_items_json")
-
-                buffer += chunk
-                marker = buffer.find('"items"')
-                if marker < 0:
-                    # Keep only a small tail so an unusually large header cannot
-                    # grow without bound while waiting for the items array.
-                    if len(buffer) > chunk_size * 2:
-                        buffer = buffer[-chunk_size:]
-                    continue
-
-                bracket = buffer.find("[", marker)
-                if bracket < 0:
-                    continue
-
-                buffer = buffer[bracket + 1:]
-                items_started = True
-
-            # Skip whitespace and the comma separating array objects.
-            while True:
-                stripped = buffer.lstrip()
-                if stripped != buffer:
-                    buffer = stripped
-
-                if buffer.startswith(","):
-                    buffer = buffer[1:]
-                    continue
-                break
-
-            if buffer.startswith("]"):
-                return
-
-            if not buffer:
-                chunk = file.read(chunk_size)
-                if not chunk:
-                    raise ValueError("invalid_cache_items_json")
-                buffer += chunk
-                continue
-
-            try:
-                item, consumed = decoder.raw_decode(buffer)
-            except json.JSONDecodeError:
-                chunk = file.read(chunk_size)
-                if not chunk:
-                    raise ValueError("invalid_cache_items_json")
-                buffer += chunk
-                continue
-
-            buffer = buffer[consumed:]
-
-            if isinstance(item, dict):
-                yield item
-
-
-def build_series_m3u_file(request):
-    """
-    Build the legacy Series catalog M3U.
-
-    The old StreamHub exposed one M3U entry per Series, not one entry per
-    episode. This keeps the playlist small and prevents TiviMate from seeing
-    every episode as a movie-like item. Seasons/episodes are supplied through
-    the Xtream player_api.php get_series_info endpoint.
-    """
-    path = CACHE_DIR / "series.m3u"
-    temporary = CACHE_DIR / (
-        f".series.m3u.{os.getpid()}.{threading.get_ident()}.building"
-    )
-
-    written = 0
-
-    try:
-        with temporary.open("w", encoding="utf-8") as file:
-            file.write("#EXTM3U\n")
-            file.write(f'# StreamHub-Version="{APP_VERSION}"\n')
-
-            for series in iter_cache_items_streaming("series"):
-                series_name = catalog_name(series)
-                category = catalog_category_name(series)
-                series_id = series_id_key(series)
-
-                if not series_id:
-                    continue
-
-                file.write(
-                    "#EXTINF:-1 "
-                    f'tvg-name="{m3u_escape(series_name)}" '
-                    f'tvg-logo="{m3u_escape(series.get("cover", ""))}" '
-                    f'group-title="{m3u_escape(category)}",'
-                    f"{m3u_escape(series_name)}\n"
-                )
-                file.write(
-                    streamhub_url_for_item(
-                        request,
-                        "series",
-                        series,
-                    )
-                    + "\n"
-                )
-                written += 1
-
-            file.flush()
-            os.fsync(file.fileno())
-
-        os.replace(temporary, path)
-        LOGGER.info(
-            "Series M3U generated: %d series, %d bytes",
-            written,
-            path.stat().st_size,
-        )
-        return path
-
-    finally:
-        try:
-            if temporary.exists():
-                temporary.unlink()
-        except OSError:
-            pass
-
-
-def send_file_stream(handler, path, content_type, chunk_size=262144):
-    """Send a prepared file in bounded chunks instead of building one giant response."""
-    size = path.stat().st_size
-
-    handler.send_response(200)
-    handler.send_header(
-        "Content-Type",
-        content_type,
-    )
-    handler.send_header(
-        "Content-Length",
-        str(size),
-    )
-    handler.send_header(
-        "Cache-Control",
-        "no-store",
-    )
-    handler.end_headers()
-
-    if handler.command == "HEAD":
-        return
-
-    with path.open("rb") as file:
-        while True:
-            chunk = file.read(chunk_size)
-            if not chunk:
-                break
-            handler.wfile.write(chunk)
-
-
 def build_m3u(
     request,
     cache_type,
 ):
-    # Series are emitted as episodes, but with explicit series/season/episode
-    # metadata. This is an M3U-only compatibility mode for players that
-    # understand extended series attributes. The playlist remains streamed
-    # from the disk-backed cache and is not assembled as one giant string.
-    if cache_type == "series":
-        path = CACHE_DIR / "series.m3u"
-        temporary = CACHE_DIR / (
-            f".series.m3u.{os.getpid()}.{threading.get_ident()}.building"
-        )
-        written = 0
-
-        try:
-            with temporary.open("w", encoding="utf-8") as file:
-                file.write("#EXTM3U\n")
-                file.write(f'# StreamHub-Version="{APP_VERSION}"\n')
-
-                for series in iter_cache_items_streaming("series"):
-                    series_name = catalog_name(series)
-                    category = catalog_category_name(series)
-                    series_id = series_id_key(series)
-
-                    if not series_id:
-                        continue
-
-                    for episode in flatten_series_episodes(series):
-                        label = episode_label(episode)
-                        season = (
-                            episode.get("season")
-                            or episode.get("season_num")
-                            or episode.get("season_number")
-                            or 0
-                        )
-                        episode_num = (
-                            episode.get("episode_num")
-                            or episode.get("episode_number")
-                            or episode.get("episode")
-                            or 0
-                        )
-
-                        # Keep the human-readable name conventional.
-                        display_name = f"{series_name} - {label}"
-
-                        # Extended M3U attributes used by some IPTV players
-                        # for series grouping. Standard M3U itself has no
-                        # native series/season hierarchy.
-                        attributes = [
-                            'tvg-type="serie"',
-                            f'tvg-name="{m3u_escape(display_name)}"',
-                            f'tvg-series="{m3u_escape(series_name)}"',
-                            f'tvg-series-id="{m3u_escape(series_id)}"',
-                            f'serie-title="{m3u_escape(series_name)}"',
-                            f'tvg-season="{m3u_escape(season)}"',
-                            f'tvg-episode="{m3u_escape(episode_num)}"',
-                            f'group-title="{m3u_escape(category)}"',
-                        ]
-
-                        logo = str(
-                            series.get("cover")
-                            or series.get("cover_big")
-                            or ""
-                        ).strip()
-                        if logo:
-                            attributes.append(
-                                f'tvg-logo="{m3u_escape(logo)}"'
-                            )
-
-                        file.write(
-                            "#EXTINF:-1 "
-                            + " ".join(attributes)
-                            + ","
-                            + m3u_escape(display_name)
-                            + "\n"
-                        )
-                        file.write(
-                            streamhub_episode_url(
-                                request,
-                                series,
-                                episode,
-                            )
-                            + "\n"
-                        )
-                        written += 1
-
-                file.flush()
-                os.fsync(file.fileno())
-
-            os.replace(temporary, path)
-            LOGGER.info(
-                "Series M3U generated: %d episodes, %d bytes",
-                written,
-                path.stat().st_size,
-            )
-            return path
-
-        finally:
-            try:
-                if temporary.exists():
-                    temporary.unlink()
-            except OSError:
-                pass
-
-    items = load_cache_items(cache_type)
+    items = load_cache_items(
+        cache_type
+    )
 
     lines = [
         "#EXTM3U",
-        f'# StreamHub-Version="{APP_VERSION}"',
+        (
+            f'# StreamHub-Version="{APP_VERSION}"'
+        ),
     ]
 
-    for item in items:
-        name = m3u_escape(catalog_name(item))
-        category = m3u_escape(catalog_category_name(item))
-        logo = str(
-            item.get("stream_icon", "")
-            or item.get("cover", "")
-            or ""
-        ).strip()
-        tvg_id = str(
-            item.get("epg_channel_id", "")
-            or item.get("epg_id", "")
-            or ""
-        ).strip()
-
-        attributes = [
-            f'tvg-id="{m3u_escape(tvg_id)}"',
-            f'tvg-name="{name}"',
-            f'group-title="{category}"',
-        ]
-
-        if logo:
-            attributes.append(
-                f'tvg-logo="{m3u_escape(logo)}"'
+    if cache_type != "series":
+        for item in items:
+            name = m3u_escape(
+                catalog_name(item)
             )
 
-        lines.append(
-            "#EXTINF:-1 "
-            + " ".join(attributes)
-            + ","
-            + name
-        )
-        lines.append(
-            streamhub_url_for_item(
-                request,
-                cache_type,
-                item,
+            category = m3u_escape(
+                catalog_category_name(
+                    item
+                )
             )
-        )
 
-    return "\n".join(lines) + "\n"
+            logo = str(
+                item.get(
+                    "stream_icon",
+                    "",
+                )
+                or item.get(
+                    "cover",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            tvg_id = str(
+                item.get(
+                    "epg_channel_id",
+                    "",
+                )
+                or item.get(
+                    "epg_id",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            attributes = [
+                f'tvg-id="{m3u_escape(tvg_id)}"',
+                f'tvg-name="{name}"',
+                f'group-title="{category}"',
+            ]
+
+            if logo:
+                attributes.append(
+                    f'tvg-logo="{m3u_escape(logo)}"'
+                )
+
+            lines.append(
+                "#EXTINF:-1 "
+                + " ".join(
+                    attributes
+                )
+                + ","
+                + name
+            )
+
+            lines.append(
+                streamhub_url_for_item(
+                    request,
+                    cache_type,
+                    item,
+                )
+            )
+
+    else:
+        for series in items:
+            series_name = catalog_name(
+                series
+            )
+
+            category = catalog_category_name(
+                series
+            )
+
+            for episode in flatten_series_episodes(
+                series
+            ):
+                label = episode_label(
+                    episode
+                )
+
+                display_name = (
+                    f"{series_name} - "
+                    f"{label}"
+                )
+
+                lines.append(
+                    "#EXTINF:-1 "
+                    f'tvg-name="{m3u_escape(display_name)}" '
+                    f'group-title="{m3u_escape(category)}",'
+                    f"{m3u_escape(display_name)}"
+                )
+
+                lines.append(
+                    streamhub_episode_url(
+                        request,
+                        series,
+                        episode,
+                    )
+                )
+
+    return (
+        "\n".join(lines)
+        + "\n"
+    )
 
 
 # ============================================================================
@@ -3252,64 +2971,71 @@ def build_m3u(
 def api_category_list(
     cache_type,
 ):
-    source = (
-        iter_cache_items_streaming(cache_type)
-        if cache_type == "series"
-        else load_cache_items(cache_type)
+    items = load_cache_items(
+        cache_type
     )
 
     categories = {}
     used = set()
 
-    for item in source:
-        category_id = catalog_category_id(item)
-        category_name = catalog_category_name(item)
+    for item in items:
+        category_id = (
+            catalog_category_id(
+                item
+            )
+        )
+
+        category_name = (
+            catalog_category_name(
+                item
+            )
+        )
 
         if category_id in used:
             continue
 
-        used.add(category_id)
-        categories[category_id] = {
+        used.add(
+            category_id
+        )
+
+        categories[
+            category_id
+        ] = {
             "category_id": category_id,
             "category_name": category_name,
             "parent_id": 0,
         }
 
-    return list(categories.values())
+    return list(
+        categories.values()
+    )
 
 
 def api_stream_list(
     cache_type,
     category_id=None,
 ):
-    source = (
-        iter_cache_items_streaming(cache_type)
-        if cache_type == "series"
-        else load_cache_items(cache_type)
+    items = load_cache_items(
+        cache_type
     )
 
     result = []
 
-    for item in source:
-        item_category_id = catalog_category_id(item)
+    for item in items:
+        item_category_id = (
+            catalog_category_id(
+                item
+            )
+        )
 
         if (
             category_id is not None
-            and str(category_id) != str(item_category_id)
+            and str(category_id)
+            != str(item_category_id)
         ):
             continue
 
-        if cache_type == "series":
-            # Do not return the cached episode payload in the catalog response.
-            # TiviMate only needs the series-level metadata here; episode data
-            # is supplied by get_series_info.
-            result.append({
-                key: value
-                for key, value in item.items()
-                if key not in ("episodes", "info", "seasons")
-            })
-        else:
-            result.append(item)
+        result.append(item)
 
     return result
 
@@ -3492,19 +3218,22 @@ def find_cached_item(
     if not item_id:
         return None
 
-    items = (
-        iter_cache_items_streaming(cache_type)
-        if cache_type == "series"
-        else load_cache_items(cache_type)
-    )
-
-    for item in items:
+    for item in load_cache_items(
+        cache_type
+    ):
         if cache_type == "series":
-            current_id = series_id_key(item)
+            current_id = series_id_key(
+                item
+            )
         else:
-            current_id = streamhub_id(cache_type, item)
+            current_id = streamhub_id(
+                cache_type,
+                item,
+            )
 
-        if current_id == str(item_id):
+        if current_id == str(
+            item_id
+        ):
             return item
 
     return None
@@ -3659,7 +3388,10 @@ def player_api_response(
         ]
 
     if action == "get_series_info":
-        series_id = query.get("series_id", [None])[0]
+        series_id = query.get(
+            "series_id",
+            [None],
+        )[0]
 
         item = find_cached_item(
             "series",
@@ -3673,25 +3405,43 @@ def player_api_response(
                 "seasons": [],
             }
 
-        # The Series cache already contains the full episode detail payload.
-        # Do not contact the provider when TiviMate opens a series. This keeps
-        # Series browsing provider-independent and avoids another expensive
-        # get_series_info request for every series the user opens.
-        info = item.get("info", {})
-        if not isinstance(info, dict):
-            info = {}
+        server, priority = get_active_provider_snapshot()
+        if not server:
+            return {
+                "info": {},
+                "episodes": {},
+                "seasons": [],
+            }
 
-        seasons = item.get("seasons", [])
-        if not isinstance(seasons, list):
-            seasons = []
+        # Series details are deliberately fetched only when the client opens
+        # a specific series. This keeps the startup/catalog refresh small and
+        # prevents thousands of episode payloads from accumulating in RAM.
+        details = fetch_series_detail(
+            server,
+            priority,
+            item,
+            0,
+        )
+
+        if not details:
+            return {
+                "info": {},
+                "episodes": {},
+                "seasons": [],
+            }
+
+        detailed_item = dict(item)
+        detailed_item["info"] = details.get("info", {})
+        detailed_item["episodes"] = details.get("episodes", {})
+        detailed_item["seasons"] = details.get("seasons", [])
 
         return {
-            "info": info,
+            "info": details.get("info", {}),
             "episodes": transform_series_info(
                 request,
-                item,
+                detailed_item,
             ),
-            "seasons": seasons,
+            "seasons": details.get("seasons", []),
         }
 
     if action == "get_vod_info":
@@ -3949,14 +3699,10 @@ def find_provider_series_match(items, target_series):
 
 
 def find_cached_episode(episode_id):
-    if not episode_id:
-        return None, None
-
-    for series_item in iter_cache_items_streaming("series"):
+    for series_item in load_cache_items("series"):
         for episode in flatten_series_episodes(series_item):
             if episode_id_key(series_item, episode) == str(episode_id):
                 return series_item, episode
-
     return None, None
 
 
@@ -3998,92 +3744,47 @@ def resolve_stream_source(cache_type, item, server, priority):
 
         elif cache_type == "series":
             series_item, episode = item
+            series_list = fetch_xtream_action(server, "get_series")
+            target_series = find_provider_series_match(series_list, series_item)
+            if not target_series or target_series.get("series_id") is None:
+                return None
 
-            # The cached Series detail response already contains the provider
-            # episode ID. Use it directly when the active provider is the
-            # provider that produced the cache. This avoids an unnecessary
-            # get_series + get_series_info round-trip every time an episode
-            # starts.
-            cached_priority = safe_int(
-                series_item.get("provider_priority", 0),
-                0,
+            details = fetch_xtream_action(
+                server,
+                "get_series_info",
+                {"series_id": target_series["series_id"]},
             )
-            episode_provider_id = episode.get("id")
 
-            if (
-                episode_provider_id is not None
-                and cached_priority == priority
-            ):
-                source = {
-                    "stream_id": str(episode_provider_id),
-                    "container_extension": stream_extension(
-                        episode,
-                        "mp4",
-                    ),
-                }
-            else:
-                # Provider failover can change Xtream stream IDs. In that
-                # case resolve the same series/episode against the new
-                # provider using season + episode number + title.
-                series_list = fetch_xtream_action(
-                    server,
-                    "get_series",
-                )
-                target_series = find_provider_series_match(
-                    series_list,
-                    series_item,
-                )
-                if not target_series or target_series.get("series_id") is None:
-                    return None
+            target_season = safe_int(episode.get("season", 0), 0)
+            target_episode_num = safe_int(episode.get("episode_num", 0), 0)
+            target_title = normalize_identity_text(episode.get("title", ""))
 
-                details = fetch_xtream_action(
-                    server,
-                    "get_series_info",
-                    {"series_id": target_series["series_id"]},
-                )
+            matches = []
+            for candidate in flatten_provider_episodes(details.get("episodes", {})):
+                if safe_int(candidate.get("season", 0), 0) != target_season:
+                    continue
+                if safe_int(candidate.get("episode_num", 0), 0) != target_episode_num:
+                    continue
+                matches.append(candidate)
 
-                target_season = safe_int(
-                    episode.get("season", 0),
-                    0,
-                )
-                target_episode_num = safe_int(
-                    episode.get("episode_num", 0),
-                    0,
-                )
-                target_title = normalize_identity_text(
-                    episode.get("title", ""),
-                )
+            if target_title:
+                titled = [
+                    candidate
+                    for candidate in matches
+                    if normalize_identity_text(candidate.get("title", "")) == target_title
+                ]
+                matches = titled or matches
 
-                matches = []
-                for candidate in flatten_provider_episodes(
-                    details.get("episodes", {})
-                ):
-                    if safe_int(candidate.get("season", 0), 0) != target_season:
-                        continue
-                    if safe_int(candidate.get("episode_num", 0), 0) != target_episode_num:
-                        continue
-                    matches.append(candidate)
+            if not matches or matches[0].get("id") is None:
+                return None
 
-                if target_title:
-                    titled = [
-                        candidate
-                        for candidate in matches
-                        if normalize_identity_text(
-                            candidate.get("title", "")
-                        ) == target_title
-                    ]
-                    matches = titled or matches
-
-                if not matches or matches[0].get("id") is None:
-                    return None
-
-                source = {
-                    "stream_id": str(matches[0]["id"]),
-                    "container_extension": stream_extension(
-                        matches[0],
-                        stream_extension(episode, "mp4"),
-                    ),
-                }
+            source = {
+                "stream_id": str(matches[0]["id"]),
+                "container_extension": stream_extension(
+                    matches[0],
+                    stream_extension(episode, "mp4"),
+                ),
+            }
         else:
             return None
 
@@ -4914,42 +4615,15 @@ class StreamHubHandler(
         }
 
         if path in playlist_types:
-            cache_type = playlist_types[path]
-
-            try:
-                playlist_path = build_m3u(
+            send_text(
+                self,
+                200,
+                build_m3u(
                     self,
-                    cache_type,
-                )
-                if isinstance(playlist_path, Path):
-                    send_file_stream(
-                        self,
-                        playlist_path,
-                        "audio/x-mpegurl; charset=utf-8",
-                    )
-                else:
-                    send_text(
-                        self,
-                        200,
-                        playlist_path,
-                        "audio/x-mpegurl; charset=utf-8",
-                    )
-            except Exception as exc:
-                LOGGER.error(
-                    "Unable to build %s M3U: %s: %s",
-                    cache_type,
-                    type(exc).__name__,
-                    exc,
-                    exc_info=True,
-                )
-                send_json(
-                    self,
-                    500,
-                    {
-                        "status": "error",
-                        "error": f"{cache_type}_m3u_generation_failed",
-                    },
-                )
+                    playlist_types[path],
+                ),
+                "audio/x-mpegurl; charset=utf-8",
+            )
             return
 
         # ------------------------------------------------------------
