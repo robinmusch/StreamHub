@@ -19,7 +19,7 @@ from xml.etree import ElementTree
 
 
 APP_NAME = "StreamHub"
-APP_VERSION = "2.1.2"
+APP_VERSION = "2.1.3"
 
 HOST = "0.0.0.0"
 PORT = 8088
@@ -1083,6 +1083,18 @@ def write_series_cache_streaming(items, provider_priority):
             os.fsync(file.fileno())
 
         os.replace(temporary, path)
+
+        # The episode playlist is derived from series.json and must never
+        # survive a cache replacement.
+        series_m3u_path = CACHE_DIR / "series.m3u"
+        try:
+            if series_m3u_path.exists():
+                series_m3u_path.unlink()
+        except OSError as exc:
+            LOGGER.warning(
+                "Unable to invalidate Series M3U cache: %s",
+                exc,
+            )
 
         write_cache_metadata(
             "series",
@@ -2913,6 +2925,164 @@ def m3u_escape(value):
     )
 
 
+
+def iter_cache_items_streaming(cache_type, chunk_size=131072):
+    """Yield cache items one JSON object at a time without loading the cache into RAM."""
+    path = CACHE_FILES[cache_type]
+
+    if not path.exists():
+        return
+
+    decoder = json.JSONDecoder()
+    buffer = ""
+    items_started = False
+
+    with path.open("r", encoding="utf-8") as file:
+        while True:
+            if not items_started:
+                chunk = file.read(chunk_size)
+                if not chunk:
+                    raise ValueError("invalid_cache_items_json")
+
+                buffer += chunk
+                marker = buffer.find('"items"')
+                if marker < 0:
+                    # Keep only a small tail so an unusually large header cannot
+                    # grow without bound while waiting for the items array.
+                    if len(buffer) > chunk_size * 2:
+                        buffer = buffer[-chunk_size:]
+                    continue
+
+                bracket = buffer.find("[", marker)
+                if bracket < 0:
+                    continue
+
+                buffer = buffer[bracket + 1:]
+                items_started = True
+
+            # Skip whitespace and the comma separating array objects.
+            while True:
+                stripped = buffer.lstrip()
+                if stripped != buffer:
+                    buffer = stripped
+
+                if buffer.startswith(","):
+                    buffer = buffer[1:]
+                    continue
+                break
+
+            if buffer.startswith("]"):
+                return
+
+            if not buffer:
+                chunk = file.read(chunk_size)
+                if not chunk:
+                    raise ValueError("invalid_cache_items_json")
+                buffer += chunk
+                continue
+
+            try:
+                item, consumed = decoder.raw_decode(buffer)
+            except json.JSONDecodeError:
+                chunk = file.read(chunk_size)
+                if not chunk:
+                    raise ValueError("invalid_cache_items_json")
+                buffer += chunk
+                continue
+
+            buffer = buffer[consumed:]
+
+            if isinstance(item, dict):
+                yield item
+
+
+def build_series_m3u_file(request):
+    """Build Series M3U directly to disk so TiviMate never causes a huge RAM allocation."""
+    path = CACHE_DIR / "series.m3u"
+    temporary = CACHE_DIR / (
+        f".series.m3u.{os.getpid()}.{threading.get_ident()}.building"
+    )
+
+    written = 0
+
+    try:
+        with temporary.open("w", encoding="utf-8") as file:
+            file.write("#EXTM3U\n")
+            file.write(f'# StreamHub-Version="{APP_VERSION}"\n')
+
+            for series in iter_cache_items_streaming("series"):
+                series_name = catalog_name(series)
+                category = catalog_category_name(series)
+
+                for episode in flatten_series_episodes(series):
+                    label = episode_label(episode)
+                    display_name = f"{series_name} - {label}"
+
+                    file.write(
+                        "#EXTINF:-1 "
+                        f'tvg-name="{m3u_escape(display_name)}" '
+                        f'group-title="{m3u_escape(category)}",'
+                        f"{m3u_escape(display_name)}\n"
+                    )
+                    file.write(
+                        streamhub_episode_url(
+                            request,
+                            series,
+                            episode,
+                        )
+                        + "\n"
+                    )
+                    written += 1
+
+            file.flush()
+            os.fsync(file.fileno())
+
+        os.replace(temporary, path)
+        LOGGER.info(
+            "Series M3U generated: %d episode(s), %d bytes",
+            written,
+            path.stat().st_size,
+        )
+        return path
+
+    finally:
+        try:
+            if temporary.exists():
+                temporary.unlink()
+        except OSError:
+            pass
+
+
+def send_file_stream(handler, path, content_type, chunk_size=262144):
+    """Send a prepared file in bounded chunks instead of building one giant response."""
+    size = path.stat().st_size
+
+    handler.send_response(200)
+    handler.send_header(
+        "Content-Type",
+        content_type,
+    )
+    handler.send_header(
+        "Content-Length",
+        str(size),
+    )
+    handler.send_header(
+        "Cache-Control",
+        "no-store",
+    )
+    handler.end_headers()
+
+    if handler.command == "HEAD":
+        return
+
+    with path.open("rb") as file:
+        while True:
+            chunk = file.read(chunk_size)
+            if not chunk:
+                break
+            handler.wfile.write(chunk)
+
+
 def build_m3u(
     request,
     cache_type,
@@ -4686,12 +4856,41 @@ class StreamHubHandler(
         }
 
         if path in playlist_types:
+            cache_type = playlist_types[path]
+
+            if cache_type == "series":
+                try:
+                    series_m3u = build_series_m3u_file(
+                        self
+                    )
+                    send_file_stream(
+                        self,
+                        series_m3u,
+                        "audio/x-mpegurl; charset=utf-8",
+                    )
+                except Exception as exc:
+                    LOGGER.error(
+                        "Unable to build Series M3U: %s: %s",
+                        type(exc).__name__,
+                        exc,
+                        exc_info=True,
+                    )
+                    send_json(
+                        self,
+                        500,
+                        {
+                            "status": "error",
+                            "error": "series_m3u_generation_failed",
+                        },
+                    )
+                return
+
             send_text(
                 self,
                 200,
                 build_m3u(
                     self,
-                    playlist_types[path],
+                    cache_type,
                 ),
                 "audio/x-mpegurl; charset=utf-8",
             )
