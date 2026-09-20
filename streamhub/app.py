@@ -12,7 +12,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 APP_NAME = "StreamHub"
-APP_VERSION = "3.0.2"
+APP_VERSION = "3.0.3"
 HOST = "0.0.0.0"
 PORT = 8088
 OPTIONS_FILE = Path("/data/options.json")
@@ -37,18 +37,6 @@ DEFAULT_CONFIG = {
     "epg_url": "",
     "epg_timeout_seconds": 30,
 }
-
-ADULT_MARKERS = ("adult", "adults", "xxx", "porn", "18+")
-
-
-def is_adult_category(item):
-    text = " ".join(str(item.get(key, "") or "") for key in ("name", "category_name", "category", "group")).casefold()
-    return any(marker in text for marker in ADULT_MARKERS)
-
-
-def show_adult_content():
-    return bool(CONFIG.get("show_adult_content", False))
-
 
 MARKERS = {
     "NL": "┃NL┃", "BE": "┃BE┃", "DE": "┃DE┃", "FR": "┃FR┃",
@@ -130,17 +118,40 @@ def public_base(request):
     return f"{proto if proto in ('http', 'https') else 'http'}://{host}".rstrip("/")
 
 
-def authorized(query):
+ADULT_MARKERS = ("adult", "adults", "xxx", "porn", "18+")
+
+
+def is_adult_item(item):
+    if not isinstance(item, dict):
+        return False
+    text = " ".join(
+        str(item.get(k, "") or "")
+        for k in ("category_name", "group", "category", "name")
+    ).casefold()
+    return any(marker in text for marker in ADULT_MARKERS)
+
+
+def authorized(query, path=""):
     key = proxy_password()
     if not key:
         return True
-    return (
-        query.get("key", [""])[0] == key
-        or (
-            query.get("username", [""])[0] == proxy_username()
-            and query.get("password", [""])[0] == key
-        )
-    )
+
+    if query.get("key", [""])[0] == key:
+        return True
+
+    if (
+        query.get("username", [""])[0] == proxy_username()
+        and query.get("password", [""])[0] == key
+    ):
+        return True
+
+    parts = [p for p in str(path or "").strip("/").split("/") if p]
+    if len(parts) >= 3 and parts[0] in {"live", "movie", "series"}:
+        username = urllib.parse.unquote(parts[1])
+        password = urllib.parse.unquote(parts[2])
+        return username == proxy_username() and password == key
+
+    return False
 
 
 def timeout():
@@ -259,16 +270,23 @@ def marker():
 
 
 def matches(item):
-    if is_adult_category(item):
-        return show_adult_content()
+    if not isinstance(item, dict):
+        return False
+
+    # Adult-content is an explicit opt-in and is independent of the country filter.
+    if is_adult_item(item):
+        return bool(CONFIG.get("show_adult_content", False))
+
     if content_mode() == "ALL":
         return True
+
     m = marker().casefold()
     if not m:
         return True
-    if not isinstance(item, dict):
-        return False
-    text = " ".join(str(item.get(k, "") or "") for k in ("name", "category_name", "group", "category")).casefold()
+    text = " ".join(
+        str(item.get(k, "") or "")
+        for k in ("name", "category_name", "group", "category")
+    ).casefold()
     return m in text
 
 
@@ -404,19 +422,21 @@ def upstream_stream_url(server, kind, source_id, extension):
 
 def stream_url(request, kind, item):
     base = public_base(request)
-    key = urllib.parse.urlencode({"key": proxy_password()}) if proxy_password() else ""
-    sid = str(item.get("stream_id") or item.get("series_id") or "")
+    user = urllib.parse.quote(proxy_username(), safe="")
+    password = urllib.parse.quote(proxy_password(), safe="")
+    sid = urllib.parse.quote(str(item.get("stream_id") or item.get("series_id") or ""), safe="")
     ext = "ts" if kind == "tv" else str(item.get("container_extension", "ts") or "ts").lstrip(".")
-    return f"{base}/{'live' if kind == 'tv' else 'movie' if kind == 'movies' else 'series'}/{urllib.parse.quote(sid, safe='')}.{ext}" + (f"?{key}" if key else "")
+    path_kind = "live" if kind == "tv" else "movie" if kind == "movies" else "series"
+    return f"{base}/{path_kind}/{user}/{password}/{sid}.{ext}"
 
 
 def series_direct_url(request, series, episode):
     base = public_base(request)
-    params = {"key": proxy_password(), "sid": series.get("series_id", ""), "s": episode.get("season", 0), "e": episode.get("episode_num", 0), "t": episode.get("title", "")}
-    params = {k: v for k, v in params.items() if v != ""}
-    eid = str(episode.get("id", ""))
+    user = urllib.parse.quote(proxy_username(), safe="")
+    password = urllib.parse.quote(proxy_password(), safe="")
+    eid = urllib.parse.quote(str(episode.get("id", "")), safe="")
     ext = str(episode.get("container_extension", "ts") or "ts").lstrip(".")
-    return f"{base}/series/{urllib.parse.quote(eid, safe='')}.{ext}?{urllib.parse.urlencode(params)}"
+    return f"{base}/series/{user}/{password}/{eid}.{ext}"
 
 
 def xtream_profile(request):
@@ -633,7 +653,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             send_json(self, 200, {"status": "ok", "application": APP_NAME, "version": APP_VERSION})
             return
-        if not authorized(query):
+        if not authorized(query, path):
             send_json(self, 401, {"status": "error", "error": "unauthorized"})
             return
         if path == "/status":
